@@ -1,0 +1,72 @@
+# MT5 project safety ignore - managed by Hermes
+
+# Secrets / credentials / account state
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*secret*
+*secrets*
+*credential*
+*credentials*
+*token*
+*passwd*
+*password*
+common.ini
+accounts.ini
+terminal.ini
+*.srv
+
+# MT5 / strategy runtime local state
+auto_quant/state/
+auto_quant/archive/
+auto_quant/*.bak*
+auto_quant/*baseline*.json
+*.supervised.log
+*_supervisor.log
+*_supervisor.stdout.log
+*_supervisor.out
+
+# Logs / reports / generated outputs
+logs/
+log/
+*.log
+*.out
+backtest_reports/
+backtest_reports_*/
+reports/
+output/
+outputs/
+*.html
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.csv
+*.xlsx
+
+# Python cache / environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# OS/editor local state
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.history/
