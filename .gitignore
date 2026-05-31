@@ -27,8 +27,14 @@ terminal.ini
 # MT5 / strategy runtime local state
 auto_quant/state/
 auto_quant/archive/
+auto_quant/backups/
+auto_quant/logs/
+auto_quant/output/
+auto_quant/plans/
+auto_quant/*.json
 auto_quant/*.bak*
 auto_quant/*baseline*.json
+research/
 *.supervised.log
 *_supervisor.log
 *_supervisor.stdout.log

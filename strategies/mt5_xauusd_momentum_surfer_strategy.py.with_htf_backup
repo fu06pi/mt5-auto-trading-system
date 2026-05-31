@@ -1,0 +1,1246 @@
+#!/usr/bin/env python3.14
+"""XAUUSD momentum surfer — opencode 做的. Catches explosive intraday moves with aggressive trailing.
+
+Core idea:
+- M1 scalper detecting momentum acceleration (velocity of velocity).
+- Enter when short-term momentum is building rapidly.
+- Ultra-tight trailing stop locks profits fast.
+- Win rate does NOT matter; a few big winners dominate return.
+
+Risk:
+- Per-trade risk 1% of equity.
+- Hard campaign drawdown limit 5%.
+- 10-day campaign target.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as dt
+import json
+import logging
+import math
+import statistics
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from pymt5linux import MetaTrader5
+
+
+LOGGER = logging.getLogger("xauusd_momentum_surfer")
+STATE_PATH_DEFAULT = "/home/chain4655/Documents/Sample/Python/xauusd_momentum_surfer_state.json"
+LOG_PATH_DEFAULT = "/home/chain4655/Documents/Sample/Python/xauusd_momentum_surfer.log"
+
+
+@dataclasses.dataclass(frozen=True)
+class StrategyConfig:
+    symbol: str
+    timeframe: str
+    host: str
+    port: int
+    live: bool
+    start_equity: float
+    daily_dd_limit: float
+    total_dd_limit: float
+    profit_target: float
+    risk_pct: float
+    max_lots: float
+    max_leverage: float
+    atr_period: int
+    vol_lookback: int
+    mom_lookback: int
+    accel_min: float
+    entry_buffer_atr: float
+    stop_atr: float
+    reward_multiple: float
+    trail_trigger_atr: float
+    trail_lock_atr: float
+    max_spread_points: float
+    max_trades_per_day: int
+    max_consecutive_losses: int
+    loss_cooldown_losses: int
+    loss_cooldown_minutes: int
+    cooldown_seconds: int
+    max_hold_minutes: int
+    loop_seconds: int
+    lookback_bars: int
+    htf_timeframe: str
+    htf_fast_sma: int
+    htf_slow_sma: int
+    state_path: str
+    log_file: str
+    terminal_path: Optional[str]
+    deviation: int
+    magic: int
+    log_level: str
+
+
+@dataclasses.dataclass
+class MarketSnapshot:
+    bar_time: dt.datetime
+    close: float
+    high: float
+    low: float
+    atr: float
+    baseline_atr: float
+    vol_ratio: float
+    mom_1: float
+    mom_2: float
+    mom_3: float
+    accel: float
+    accel_score: float
+    spread_points: float
+    signal: str
+    signal_strength: float
+    htf_bias: str = "NEUTRAL"
+
+
+@dataclasses.dataclass
+class PositionState:
+    ticket: int
+    symbol: str
+    magic: int = 0
+    type: int = 0
+    volume: float = 0.0
+    price_open: float = 0.0
+    sl: float = 0.0
+    tp: float = 0.0
+    profit: float = 0.0
+    time_open: Optional[int] = None
+
+
+@dataclasses.dataclass
+class StrategyState:
+    current_day: Optional[str] = None
+    day_start_equity: Optional[float] = None
+    last_equity: Optional[float] = None
+    initial_equity: Optional[float] = None
+    max_equity_seen: Optional[float] = None
+    trades_today: int = 0
+    consecutive_losses: int = 0
+    loss_cooldown_until: Optional[str] = None
+    loss_cooldown_triggered_at: Optional[str] = None
+    last_trade_time: Optional[str] = None
+    last_processed_deal_time: Optional[str] = None
+    last_close_profit: float = 0.0
+    paused_reason: str = ""
+    paused: bool = False
+
+
+class XAUUSDMomentumSurferStrategy:
+    def __init__(self, config: StrategyConfig):
+        self.config = config
+        self.mt5 = MetaTrader5(host=config.host, port=config.port)
+        self.symbol = config.symbol
+        self.timeframe = self._resolve_timeframe(config.timeframe)
+        self.state_path = Path(config.state_path)
+        self.log_file = Path(config.log_file)
+        self.state = self._load_state()
+        self._last_bar_time: Optional[dt.datetime] = None
+        self._equity_fail_streak = 0
+        self._rates_fail_streak = 0
+        self._connect_fail_streak = 0
+        self._last_reconnect_ts = 0.0
+        self._initialized = False
+
+    def run(self) -> None:
+        self._connect()
+        self._prepare_symbol()
+
+        while True:
+            try:
+                snapshot = self._build_snapshot()
+                if not self._initialized:
+                    self._ensure_day_context(snapshot.bar_time)
+                    self._seed_equity()
+                    self._log(
+                        "MomentumSurfer started: %s %s live=%s",
+                        self.symbol,
+                        self.config.timeframe,
+                        self.config.live,
+                    )
+                    self._initialized = True
+
+                self._ensure_day_context(snapshot.bar_time)
+                self._risk_guard(snapshot)
+
+                if self._last_bar_time is not None and snapshot.bar_time <= self._last_bar_time:
+                    time.sleep(self.config.loop_seconds)
+                    continue
+
+                self._last_bar_time = snapshot.bar_time
+                self._handle_bar(snapshot)
+            except KeyboardInterrupt:
+                self._log("Interrupted by user, shutting down.")
+                break
+            except SystemExit:
+                raise
+            except Exception as exc:
+                if self._is_transient_ipc_issue(exc):
+                    self._handle_transient_ipc(exc)
+                    continue
+                self._log("Main loop error: %s", exc)
+                time.sleep(self.config.loop_seconds)
+
+        self._shutdown()
+
+    def _load_state(self) -> StrategyState:
+        if not self.state_path.exists():
+            return StrategyState()
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            return StrategyState(
+                current_day=data.get("current_day"),
+                day_start_equity=data.get("day_start_equity"),
+                last_equity=data.get("last_equity"),
+                initial_equity=data.get("initial_equity"),
+                max_equity_seen=data.get("max_equity_seen"),
+                trades_today=int(data.get("trades_today", 0)),
+                consecutive_losses=int(data.get("consecutive_losses", 0)),
+                loss_cooldown_until=data.get("loss_cooldown_until"),
+                loss_cooldown_triggered_at=data.get("loss_cooldown_triggered_at"),
+                last_trade_time=data.get("last_trade_time"),
+                last_processed_deal_time=data.get("last_processed_deal_time"),
+                last_close_profit=float(data.get("last_close_profit", 0.0)),
+                paused_reason=str(data.get("paused_reason", "")),
+                paused=bool(data.get("paused", False)),
+            )
+        except Exception as exc:
+            self._log("State load failed, starting fresh: %s", exc)
+            return StrategyState()
+
+    def _save_state(self) -> None:
+        payload = {
+            "current_day": self.state.current_day,
+            "day_start_equity": self.state.day_start_equity,
+            "last_equity": self.state.last_equity,
+            "initial_equity": self.state.initial_equity,
+            "max_equity_seen": self.state.max_equity_seen,
+            "trades_today": self.state.trades_today,
+            "consecutive_losses": self.state.consecutive_losses,
+            "loss_cooldown_until": self.state.loss_cooldown_until,
+            "loss_cooldown_triggered_at": self.state.loss_cooldown_triggered_at,
+            "last_trade_time": self.state.last_trade_time,
+            "last_processed_deal_time": self.state.last_processed_deal_time,
+            "last_close_profit": self.state.last_close_profit,
+            "paused_reason": self.state.paused_reason,
+            "paused": self.state.paused,
+        }
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception as exc:
+            self._log("State save failed: %s", exc)
+
+    def _log(self, message: str, *args: Any) -> None:
+        line = message % args if args else message
+        LOGGER.info(line)
+        try:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_file.open("a", encoding="utf-8") as f:
+                f.write(f"{dt.datetime.now().isoformat(sep=' ', timespec='seconds')} {line}\n")
+        except Exception:
+            pass
+
+    def _connect(self) -> None:
+        if self.config.terminal_path:
+            self._log("Initializing terminal path: %s", self.config.terminal_path)
+            ok = self.mt5.initialize(path=self.config.terminal_path)
+        else:
+            self._log("Initializing MT5 bridge without explicit terminal path")
+            ok = self.mt5.initialize()
+        self._log("initialize() -> %s | last_error=%s", ok, self.mt5.last_error())
+        if not ok:
+            raise RuntimeError(f"MT5 initialize failed: {self.mt5.last_error()}")
+
+    def _is_connected(self) -> bool:
+        try:
+            ti = self.mt5.terminal_info()
+            ai = self.mt5.account_info()
+            return ti is not None and ai is not None
+        except Exception:
+            return False
+
+    def _prepare_symbol(self) -> None:
+        if not self.mt5.symbol_select(self.symbol, True):
+            raise RuntimeError(f"symbol_select failed for {self.symbol}: {self.mt5.last_error()}")
+        info = self.mt5.symbol_info(self.symbol)
+        if info is None:
+            raise RuntimeError(f"symbol_info is None for {self.symbol}")
+        self._log(
+            "Symbol ready: %s | digits=%s point=%s volume_min=%s volume_step=%s",
+            self.symbol,
+            getattr(info, "digits", "?"),
+            getattr(info, "point", "?"),
+            getattr(info, "volume_min", "?"),
+            getattr(info, "volume_step", "?"),
+        )
+
+    def _shutdown(self) -> None:
+        try:
+            self.mt5.shutdown()
+        except Exception:
+            pass
+
+    def _seed_equity(self) -> None:
+        equity = self._get_equity()
+        if self.state.initial_equity is None:
+            self.state.initial_equity = equity
+        if self.state.day_start_equity is None:
+            self.state.day_start_equity = equity
+        if self.state.max_equity_seen is None:
+            self.state.max_equity_seen = equity
+        self.state.last_equity = equity
+        self._save_state()
+
+    def _get_equity(self) -> float:
+        for attempt in range(3):
+            info = self.mt5.account_info()
+            if info is not None:
+                equity = getattr(info, "equity", None)
+                if equity is None:
+                    equity = getattr(info, "balance", None)
+                if equity is not None:
+                    self._equity_fail_streak = 0
+                    return float(equity)
+            self._equity_fail_streak += 1
+            self._log(
+                "account_info unavailable (attempt %s/3, streak=%s): %s",
+                attempt + 1,
+                self._equity_fail_streak,
+                self.mt5.last_error(),
+            )
+            time.sleep(1)
+            if self._equity_fail_streak < 3:
+                continue
+            try:
+                self._handle_transient_ipc(RuntimeError("account_info unavailable"))
+                self._equity_fail_streak = 0
+                self._connect_fail_streak = 0
+            except Exception as exc:
+                self._connect_fail_streak += 1
+                self._log("Reconnect attempt failed (streak=%s): %s", self._connect_fail_streak, exc)
+        raise RuntimeError(f"account_info is None after reconnect attempts: {self.mt5.last_error()}")
+
+    def _ensure_day_context(self, bar_time: dt.datetime) -> None:
+        day_key = bar_time.date().isoformat()
+        if self.state.current_day is None:
+            self.state.current_day = day_key
+            self.state.day_start_equity = self._get_equity()
+            self.state.last_equity = self.state.day_start_equity
+            self._save_state()
+            return
+        if self.state.current_day == day_key:
+            return
+        self.state.current_day = day_key
+        current_equity = self._get_equity()
+        self.state.day_start_equity = current_equity
+        self.state.last_equity = current_equity
+        self.state.trades_today = 0
+        self.state.consecutive_losses = 0
+        self.state.paused = False
+        self.state.paused_reason = ""
+        self._save_state()
+        self._log("New trading day: %s | day_start_equity=%.2f", day_key, current_equity)
+
+    def _cooldown_active(self, now: dt.datetime) -> bool:
+        until = self.state.loss_cooldown_until
+        if not until:
+            return False
+        try:
+            until_dt = dt.datetime.fromisoformat(until)
+        except Exception:
+            return False
+        if now < until_dt:
+            remaining = until_dt - now
+            self._log(
+                "Loss cooldown active until %s | remaining=%s | consecutive_losses=%d",
+                until_dt.isoformat(sep=' '),
+                str(remaining).split('.')[0],
+                self.state.consecutive_losses,
+            )
+            return True
+        self.state.loss_cooldown_until = None
+        self.state.loss_cooldown_triggered_at = None
+        self._save_state()
+        self._log("Loss cooldown expired at %s", now.isoformat(sep=' '))
+        return False
+
+    def _trigger_loss_cooldown(self, now: dt.datetime) -> None:
+        cooldown_until = now + dt.timedelta(minutes=int(self.config.loss_cooldown_minutes))
+        self.state.loss_cooldown_triggered_at = now.isoformat()
+        self.state.loss_cooldown_until = cooldown_until.isoformat()
+        self._save_state()
+        self._log(
+            "Loss cooldown triggered: consecutive_losses=%d threshold=%d until=%s",
+            self.state.consecutive_losses,
+            self.config.loss_cooldown_losses,
+            cooldown_until.isoformat(sep=' '),
+        )
+
+    def _maybe_handle_loss_cooldown(self, now: dt.datetime) -> None:
+        if self.state.consecutive_losses >= int(self.config.loss_cooldown_losses):
+            if not self.state.loss_cooldown_until:
+                self._trigger_loss_cooldown(now)
+            return
+        self._cooldown_active(now)
+
+    def _risk_guard(self, snapshot: MarketSnapshot) -> None:
+        equity = self._get_equity()
+        self.state.last_equity = equity
+        if self.state.initial_equity is None:
+            self.state.initial_equity = equity
+        if self.state.day_start_equity is None:
+            self.state.day_start_equity = equity
+        if self.state.max_equity_seen is None or equity > self.state.max_equity_seen:
+            self.state.max_equity_seen = equity
+
+        day_start = max(float(self.state.day_start_equity), 1e-9)
+        initial_equity = max(float(self.state.initial_equity), 1e-9)
+        max_equity = max(float(self.state.max_equity_seen), 1e-9)
+
+        daily_dd = 1.0 - (equity / day_start)
+        total_dd = 1.0 - (equity / max_equity)
+        profit_progress = equity / initial_equity - 1.0
+
+        self._log(
+            "Risk | equity=%.2f day_dd=%.2f%% total_dd=%.2f%% profit=%.2f%% paused=%s",
+            equity,
+            daily_dd * 100.0,
+            total_dd * 100.0,
+            profit_progress * 100.0,
+            self.state.paused,
+        )
+        self._save_state()
+
+        if daily_dd >= self.config.daily_dd_limit:
+            self.state.paused = True
+            self.state.paused_reason = (
+                f"Daily drawdown {daily_dd * 100.0:.2f}% >= {self.config.daily_dd_limit * 100.0:.2f}%"
+            )
+            self._log(self.state.paused_reason)
+            self.close_all_positions()
+            self._save_state()
+            raise SystemExit(1)
+
+        if total_dd >= self.config.total_dd_limit:
+            self.state.paused = True
+            self.state.paused_reason = (
+                f"Total drawdown {total_dd * 100.0:.2f}% >= {self.config.total_dd_limit * 100.0:.2f}%"
+            )
+            self._log(self.state.paused_reason)
+            self.close_all_positions()
+            self._save_state()
+            raise SystemExit(1)
+
+        if profit_progress >= self.config.profit_target:
+            self.state.paused = True
+            self.state.paused_reason = f"Profit target reached: {profit_progress * 100.0:.2f}%"
+            self._log(self.state.paused_reason)
+            self.close_all_positions()
+            self._save_state()
+            raise SystemExit(0)
+
+    def _build_snapshot(self) -> MarketSnapshot:
+        need = max(self.config.atr_period, self.config.vol_lookback, self.config.mom_lookback) + 10
+        bars = self._fetch_bars(min_count=need)
+        if len(bars) < need:
+            raise RuntimeError(
+                f"Not enough bars: got={len(bars)} need={need}"
+            )
+
+        last_closed = bars[-2]
+        closes = [bar["close"] for bar in bars[:-1]]
+        highs = [bar["high"] for bar in bars[:-1]]
+        lows = [bar["low"] for bar in bars[:-1]]
+
+        bar_time = self._bar_time(last_closed)
+        atr = self._atr(bars[:-1], self.config.atr_period)
+        baseline_atr = self._atr(bars[:-1 - max(0, self.config.mom_lookback)], min(self.config.vol_lookback, self.config.atr_period))
+        vol_ratio = atr / max(baseline_atr, 1e-9)
+
+        mom_1 = closes[-1] - closes[-2] if len(closes) >= 2 else 0.0
+        mom_2 = closes[-2] - closes[-3] if len(closes) >= 3 else 0.0
+        mom_3 = closes[-3] - closes[-4] if len(closes) >= 4 else 0.0
+        accel = mom_1 - mom_2
+
+        accel_score = self._score_accel(mom_1, mom_2, mom_3, accel, atr, vol_ratio)
+        signal, strength = self._decide_signal(mom_1, mom_2, accel, accel_score, atr, vol_ratio)
+        spread_points = self._spread_points()
+        htf_bias = self._htf_bias(bar_time)
+        # HTF filter temporarily disabled - uncomment to re-enable
+        # if htf_bias == "NEUTRAL":
+        #     signal = "NONE"
+        #     strength = 0.0
+        # elif htf_bias == "BULL" and signal == "SELL":
+        #     signal = "NONE"
+        #     strength = 0.0
+        # elif htf_bias == "BEAR" and signal == "BUY":
+        #     signal = "NONE"
+        #     strength = 0.0
+
+        return MarketSnapshot(
+            bar_time=bar_time,
+            close=float(last_closed["close"]),
+            high=float(last_closed["high"]),
+            low=float(last_closed["low"]),
+            atr=atr,
+            baseline_atr=baseline_atr,
+            vol_ratio=vol_ratio,
+            mom_1=mom_1,
+            mom_2=mom_2,
+            mom_3=mom_3,
+            accel=accel,
+            accel_score=accel_score,
+            spread_points=spread_points,
+            signal=signal,
+            signal_strength=strength,
+            htf_bias=htf_bias,
+        )
+
+    def _fetch_bars(self, min_count: Optional[int] = None) -> List[Dict[str, float]]:
+        fetch_count = max(int(self.config.lookback_bars), int(min_count or 0))
+        while True:
+            for attempt in range(3):
+                rates = self.mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, fetch_count)
+                if rates is not None:
+                    self._rates_fail_streak = 0
+                    return [self._normalize_bar(row) for row in list(rates)]
+
+                self._rates_fail_streak += 1
+                self._log(
+                    "copy_rates_from_pos unavailable (attempt %s/3, streak=%s): %s",
+                    attempt + 1,
+                    self._rates_fail_streak,
+                    self.mt5.last_error(),
+                )
+                time.sleep(1)
+                if self._rates_fail_streak < 3:
+                    continue
+                try:
+                    self._handle_transient_ipc(RuntimeError("copy_rates_from_pos unavailable"))
+                    self._rates_fail_streak = 0
+                    self._connect_fail_streak = 0
+                except Exception as exc:
+                    self._connect_fail_streak += 1
+                    self._log("Reconnect after rates failure failed (streak=%s): %s", self._connect_fail_streak, exc)
+                break
+
+    def _normalize_bar(self, row: Any) -> Dict[str, float]:
+        def get(key: str, fallback_index: Optional[int] = None) -> float:
+            try:
+                if isinstance(row, dict):
+                    return float(row[key])
+                try:
+                    return float(row[key])
+                except Exception:
+                    pass
+                if hasattr(row, key):
+                    return float(getattr(row, key))
+                if fallback_index is not None:
+                    return float(row[fallback_index])
+            except Exception:
+                pass
+            raise KeyError(key)
+
+        ts = int(get("time", 0))
+        return {
+            "time": float(ts),
+            "open": get("open", 1),
+            "high": get("high", 2),
+            "low": get("low", 3),
+            "close": get("close", 4),
+            "tick_volume": get("tick_volume", 5) if self._has_field(row, "tick_volume") else 0.0,
+        }
+
+    def _has_field(self, row: Any, name: str) -> bool:
+        try:
+            if isinstance(row, dict):
+                return name in row
+            if hasattr(row, "dtype") and getattr(row.dtype, "names", None):
+                return name in row.dtype.names
+            return hasattr(row, name)
+        except Exception:
+            return False
+
+    def _bar_time(self, bar: Dict[str, float]) -> dt.datetime:
+        return dt.datetime.fromtimestamp(int(bar["time"]))
+
+    def _atr(self, bars: Sequence[Dict[str, float]], period: int) -> float:
+        if len(bars) < period + 1:
+            return 0.0
+        trs: List[float] = []
+        for i in range(1, period + 1):
+            curr = bars[-i]
+            prev = bars[-i - 1]
+            tr = max(
+                curr["high"] - curr["low"],
+                abs(curr["high"] - prev["close"]),
+                abs(curr["low"] - prev["close"]),
+            )
+            trs.append(tr)
+        atr = statistics.fmean(trs)
+        return max(atr, self._point() * 5)
+
+    def _score_accel(self, mom_1: float, mom_2: float, mom_3: float, accel: float, atr: float, vol_ratio: float) -> float:
+        if atr <= 0:
+            return 0.0
+
+        accel_norm = abs(accel) / max(atr, 1e-9)
+        mom_alignment = 0.0
+        if mom_1 > 0 and mom_2 > 0 and mom_3 > 0:
+            mom_alignment = 0.3
+        elif mom_1 < 0 and mom_2 < 0 and mom_3 < 0:
+            mom_alignment = 0.3
+
+        mom_strength = (abs(mom_1) / max(atr, 1e-9)) * 0.3
+        vol_boost = max(0.0, (vol_ratio - 1.0)) * 0.4
+
+        score = accel_norm + mom_alignment + mom_strength + vol_boost
+        return score
+
+    def _decide_signal(self, mom_1: float, mom_2: float, accel: float, accel_score: float, atr: float, vol_ratio: float) -> Tuple[str, float]:
+        spread = self._spread_points()
+        if spread > self.config.max_spread_points:
+            return "NONE", 0.0
+        if vol_ratio < 1.0:
+            return "NONE", 0.0
+        if accel_score < self.config.accel_min:
+            return "NONE", 0.0
+
+        needed = mom_1 > 0 and mom_2 > 0 and accel > 0
+        if needed and accel_score >= self.config.accel_min:
+            return "BUY", accel_score
+        needed = mom_1 < 0 and mom_2 < 0 and accel < 0
+        if needed and accel_score >= self.config.accel_min:
+            return "SELL", accel_score
+
+        return "NONE", accel_score
+
+    def _handle_bar(self, snapshot: MarketSnapshot) -> None:
+        self._sync_closed_trades()
+        positions = self._positions()
+        foreign_positions = self._foreign_positions()
+
+        self._log(
+            "Bar %s | close=%.2f atr=%.2f vol_ratio=%.2f accel=%.4f score=%.2f signal=%s strength=%.2f htf=%s spread=%.1f positions=%d foreign=%d trades_today=%d losses=%d",
+            snapshot.bar_time,
+            snapshot.close,
+            snapshot.atr,
+            snapshot.vol_ratio,
+            snapshot.accel,
+            snapshot.accel_score,
+            snapshot.signal,
+            snapshot.signal_strength,
+            snapshot.htf_bias,
+            snapshot.spread_points,
+            len(positions),
+            len(foreign_positions),
+            self.state.trades_today,
+            self.state.consecutive_losses,
+        )
+
+        if self.state.paused:
+            self._log("Trading paused: %s", self.state.paused_reason)
+            return
+
+        if self._cooldown_active(snapshot.bar_time):
+            if positions:
+                self._trail_position(snapshot, positions[0])
+            return
+
+        if self.state.trades_today >= self.config.max_trades_per_day:
+            self._log("Daily trade cap reached: %d", self.state.trades_today)
+            if positions:
+                self._trail_position(snapshot, positions[0])
+            return
+
+        if self.state.consecutive_losses >= self.config.max_consecutive_losses:
+            self._log("Consecutive loss cap reached: %d", self.state.consecutive_losses)
+            if positions:
+                self._trail_position(snapshot, positions[0])
+            return
+
+        if not positions:
+            if foreign_positions:
+                self._log("Foreign position present (%d); skip new entry.", len(foreign_positions))
+                return
+            if snapshot.signal != "NONE" and self._cooldown_ok(snapshot.bar_time):
+                self._enter(snapshot)
+            return
+
+        pos = positions[0]
+        if self._max_hold_exceeded(pos, snapshot.bar_time):
+            self._log("Max holding time exceeded, closing position.")
+            self.close_all_positions()
+            return
+
+        self._trail_position(snapshot, pos)
+
+    def _all_positions(self) -> List[PositionState]:
+        raw = self.mt5.positions_get(symbol=self.symbol)
+        if not raw:
+            return []
+        out: List[PositionState] = []
+        for pos in raw:
+            out.append(
+                PositionState(
+                    ticket=int(getattr(pos, "ticket", 0)),
+                    symbol=str(getattr(pos, "symbol", self.symbol)),
+                    magic=int(getattr(pos, "magic", 0) or 0),
+                    type=int(getattr(pos, "type", 0)),
+                    volume=float(getattr(pos, "volume", 0.0)),
+                    price_open=float(getattr(pos, "price_open", 0.0)),
+                    sl=float(getattr(pos, "sl", 0.0)),
+                    tp=float(getattr(pos, "tp", 0.0)),
+                    profit=float(getattr(pos, "profit", 0.0)),
+                    time_open=int(getattr(pos, "time", 0)) if getattr(pos, "time", None) is not None else None,
+                )
+            )
+        return out
+
+    def _foreign_positions(self) -> List[PositionState]:
+        return [pos for pos in self._all_positions() if int(getattr(pos, "magic", 0)) != int(self.config.magic)]
+
+    def _positions(self) -> List[PositionState]:
+        return [pos for pos in self._all_positions() if int(getattr(pos, "magic", 0)) == int(self.config.magic)]
+
+    def _trail_position(self, snapshot: MarketSnapshot, pos: PositionState) -> None:
+        if snapshot.atr <= 0:
+            return
+        ask, bid = self._tick_prices()
+        current_price = bid if pos.type == self.mt5.POSITION_TYPE_BUY else ask
+        profit_move = (current_price - pos.price_open) if pos.type == self.mt5.POSITION_TYPE_BUY else (pos.price_open - current_price)
+
+        if profit_move >= snapshot.atr * self.config.trail_trigger_atr:
+            if pos.type == self.mt5.POSITION_TYPE_BUY:
+                new_sl = max(pos.sl, current_price - snapshot.atr * self.config.trail_lock_atr)
+                if pos.sl <= 0 or new_sl > pos.sl:
+                    self._modify_position(pos, sl=new_sl, tp=pos.tp)
+            else:
+                base_sl = pos.sl if pos.sl > 0 else current_price + snapshot.atr * 100.0
+                new_sl = min(base_sl, current_price + snapshot.atr * self.config.trail_lock_atr)
+                if pos.sl <= 0 or new_sl < pos.sl:
+                    self._modify_position(pos, sl=new_sl, tp=pos.tp)
+
+    def _enter(self, snapshot: MarketSnapshot) -> None:
+        direction = snapshot.signal
+        if direction not in {"BUY", "SELL"}:
+            return
+
+        ask, bid = self._tick_prices()
+        price = ask if direction == "BUY" else bid
+        sl, tp = self._build_sl_tp(direction, price, snapshot.atr)
+        volume = self._size_position(direction, price, sl)
+        if volume <= 0:
+            raise RuntimeError("Calculated volume is zero")
+
+        request = self._order_request(direction, volume, price, sl, tp)
+        self._log(
+            "ENTRY %s volume=%.2f price=%.2f sl=%.2f tp=%.2f equity=%.2f score=%.2f",
+            direction,
+            volume,
+            price,
+            sl,
+            tp,
+            self._get_equity(),
+            snapshot.signal_strength,
+        )
+
+        if self.config.live:
+            result = self._send_order_with_filling_fallback(request)
+            self._log("order_send result: %s", self._result_to_dict(result))
+            if result is None:
+                raise RuntimeError(f"order_send failed: {self.mt5.last_error()}")
+        else:
+            self._log("DRY-RUN request: %s", request)
+
+        self.state.trades_today += 1
+        self.state.last_trade_time = snapshot.bar_time.isoformat()
+        self._save_state()
+
+    def _build_sl_tp(self, direction: str, price: float, atr: float) -> Tuple[float, float]:
+        sl_distance = atr * self.config.stop_atr
+        tp_distance = sl_distance * self.config.reward_multiple
+        point = self._point()
+
+        if direction == "BUY":
+            sl = price - sl_distance
+            tp = price + tp_distance
+        else:
+            sl = price + sl_distance
+            tp = price - tp_distance
+
+        digits = self._digits()
+        sl = self._round_to_digits(sl, digits)
+        tp = self._round_to_digits(tp, digits)
+        if abs(price - sl) < point:
+            sl = price - point if direction == "BUY" else price + point
+        if abs(price - tp) < point:
+            tp = price + point if direction == "BUY" else price - point
+        return sl, tp
+
+    def _size_position(self, direction: str, price: float, sl: float) -> float:
+        equity = self._get_equity()
+        risk_amount = equity * self.config.risk_pct
+        info = self.mt5.symbol_info(self.symbol)
+        if info is None:
+            raise RuntimeError("symbol_info unavailable")
+
+        risk_per_lot = self._risk_per_lot(direction, price, sl)
+        if risk_per_lot <= 0:
+            raise RuntimeError("risk_per_lot invalid")
+
+        raw_volume = risk_amount / risk_per_lot
+        raw_volume = min(raw_volume, self.config.max_lots)
+
+        margin_lot = self._margin_per_lot(direction, price)
+        if margin_lot > 0:
+            acc = self.mt5.account_info()
+            free_margin = float(getattr(acc, "margin_free", equity) if acc is not None else equity)
+            max_by_margin = (free_margin * 0.85) / margin_lot
+            raw_volume = min(raw_volume, max_by_margin)
+
+        min_vol = float(getattr(info, "volume_min", 0.01))
+        step = float(getattr(info, "volume_step", 0.01))
+        raw_volume = max(raw_volume, min_vol)
+        volume = self._round_volume(raw_volume, step)
+        return min(volume, self.config.max_lots)
+
+    def _risk_per_lot(self, direction: str, price: float, sl: float) -> float:
+        order_type = self.mt5.ORDER_TYPE_BUY if direction == "BUY" else self.mt5.ORDER_TYPE_SELL
+        try:
+            value = self.mt5.order_calc_profit(order_type, self.symbol, 1.0, price, sl)
+            if value is not None:
+                return abs(float(value))
+        except Exception:
+            pass
+        info = self.mt5.symbol_info(self.symbol)
+        if info is None:
+            return 0.0
+        contract_size = float(getattr(info, "trade_contract_size", 1.0))
+        return abs(price - sl) * contract_size
+
+    def _margin_per_lot(self, direction: str, price: float) -> float:
+        order_type = self.mt5.ORDER_TYPE_BUY if direction == "BUY" else self.mt5.ORDER_TYPE_SELL
+        try:
+            value = self.mt5.order_calc_margin(order_type, self.symbol, 1.0, price)
+            if value is not None:
+                return abs(float(value))
+        except Exception:
+            pass
+        return 0.0
+
+    def _order_request(self, direction: str, volume: float, price: float, sl: float, tp: float) -> Dict[str, Any]:
+        filling = self._select_filling_mode()
+        return {
+            "action": self.mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": float(volume),
+            "type": self.mt5.ORDER_TYPE_BUY if direction == "BUY" else self.mt5.ORDER_TYPE_SELL,
+            "price": float(price),
+            "sl": float(sl),
+            "tp": float(tp),
+            "deviation": int(self.config.deviation),
+            "magic": int(self.config.magic),
+            "comment": "xauusd-surfer-live" if self.config.live else "xauusd-surfer-dryrun",
+            "type_time": self.mt5.ORDER_TIME_GTC,
+            "type_filling": filling,
+        }
+
+    def _select_filling_mode(self) -> int:
+        info = self.mt5.symbol_info(self.symbol)
+        candidates: List[int] = []
+        if info is not None:
+            raw = getattr(info, "filling_mode", None)
+            if raw is None:
+                raw = getattr(info, "trade_fill_mode", None)
+            if raw is not None:
+                mapping = {
+                    0: self.mt5.ORDER_FILLING_FOK,
+                    1: self.mt5.ORDER_FILLING_IOC,
+                    2: self.mt5.ORDER_FILLING_RETURN,
+                    3: self.mt5.ORDER_FILLING_BOC,
+                }
+                try:
+                    raw_i = int(raw)
+                    if raw_i in mapping:
+                        candidates.append(mapping[raw_i])
+                except Exception:
+                    pass
+        for mode in (self.mt5.ORDER_FILLING_IOC, self.mt5.ORDER_FILLING_RETURN, self.mt5.ORDER_FILLING_FOK):
+            if mode not in candidates:
+                candidates.append(mode)
+        return candidates[0]
+
+    def _send_order_with_filling_fallback(self, request: Dict[str, Any]) -> Any:
+        requested = int(request.get("type_filling", self.mt5.ORDER_FILLING_RETURN))
+        fallback_modes = [requested, self.mt5.ORDER_FILLING_RETURN, self.mt5.ORDER_FILLING_IOC, self.mt5.ORDER_FILLING_FOK]
+        tried: List[int] = []
+        last_result = None
+        for mode in fallback_modes:
+            if mode in tried:
+                continue
+            tried.append(mode)
+            req = dict(request)
+            req["type_filling"] = mode
+            result = self.mt5.order_send(req)
+            last_result = result
+            self._log("order_send(type_filling=%s) -> %s", mode, self._result_to_dict(result))
+            if result is not None:
+                code = getattr(result, "retcode", None)
+                if code in {self.mt5.TRADE_RETCODE_DONE, self.mt5.TRADE_RETCODE_PLACED, self.mt5.TRADE_RETCODE_DONE_PARTIAL}:
+                    return result
+                if code not in {self.mt5.TRADE_RETCODE_INVALID_FILL, self.mt5.TRADE_RETCODE_INVALID_ORDER}:
+                    return result
+        return last_result
+
+    def _modify_position(self, pos: PositionState, sl: float, tp: float) -> None:
+        request = {
+            "action": self.mt5.TRADE_ACTION_SLTP,
+            "symbol": pos.symbol,
+            "position": pos.ticket,
+            "sl": float(sl),
+            "tp": float(tp),
+            "magic": int(self.config.magic),
+            "comment": "surfer-trail",
+        }
+        if self.config.live:
+            result = self.mt5.order_send(request)
+            self._log("SLTP modify result: %s", self._result_to_dict(result))
+            if result is None:
+                self._log("SLTP modify failed: %s", self.mt5.last_error())
+        else:
+            self._log("DRY-RUN SLTP modify: %s", request)
+
+    def close_all_positions(self) -> None:
+        positions = self._positions()
+        if not positions:
+            self._log("No positions to close.")
+            return
+        ask, bid = self._tick_prices()
+        for pos in positions:
+            price = bid if pos.type == self.mt5.POSITION_TYPE_BUY else ask
+            request = {
+                "action": self.mt5.TRADE_ACTION_DEAL,
+                "symbol": pos.symbol,
+                "volume": pos.volume,
+                "type": self.mt5.ORDER_TYPE_SELL if pos.type == self.mt5.POSITION_TYPE_BUY else self.mt5.ORDER_TYPE_BUY,
+                "position": pos.ticket,
+                "price": price,
+                "deviation": int(self.config.deviation),
+                "magic": int(self.config.magic),
+                "comment": "surfer-close-all",
+                "type_time": self.mt5.ORDER_TIME_GTC,
+                "type_filling": self._select_filling_mode(),
+            }
+            if self.config.live:
+                result = self._send_order_with_filling_fallback(request)
+                self._log("Close result: %s", self._result_to_dict(result))
+            else:
+                self._log("DRY-RUN close request: %s", request)
+
+    def _tick_prices(self) -> Tuple[float, float]:
+        tick = self.mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            raise RuntimeError(f"symbol_info_tick failed: {self.mt5.last_error()}")
+        ask = float(getattr(tick, "ask", 0.0) or getattr(tick, "last", 0.0) or 0.0)
+        bid = float(getattr(tick, "bid", 0.0) or getattr(tick, "last", 0.0) or 0.0)
+        if ask <= 0 or bid <= 0:
+            raise RuntimeError(f"Invalid bid/ask: ask={ask} bid={bid}")
+        return ask, bid
+
+    def _point(self) -> float:
+        info = self.mt5.symbol_info(self.symbol)
+        if info is None:
+            raise RuntimeError("symbol_info unavailable")
+        return float(getattr(info, "point", 0.0) or 0.0)
+
+    def _digits(self) -> int:
+        info = self.mt5.symbol_info(self.symbol)
+        if info is None:
+            raise RuntimeError("symbol_info unavailable")
+        return int(getattr(info, "digits", 0) or 0)
+
+    def _spread_points(self) -> float:
+        tick = self.mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            raise RuntimeError(f"symbol_info_tick failed: {self.mt5.last_error()}")
+        ask = float(getattr(tick, "ask", 0.0) or getattr(tick, "last", 0.0) or 0.0)
+        bid = float(getattr(tick, "bid", 0.0) or getattr(tick, "last", 0.0) or 0.0)
+        if ask <= 0 or bid <= 0:
+            raise RuntimeError(f"Invalid bid/ask: ask={ask} bid={bid}")
+        point = self._point()
+        if point <= 0:
+            raise RuntimeError("point unavailable")
+        return abs(ask - bid) / point
+
+    def _htf_bias(self, bar_time: dt.datetime) -> str:
+        htf_tf = self._resolve_timeframe(self.config.htf_timeframe)
+        bars = self.mt5.copy_rates_from_pos(self.symbol, htf_tf, 0, max(self.config.htf_slow_sma + 10, 120))
+        if bars is None:
+            return "NEUTRAL"
+        htf_bars = [self._normalize_bar(row) for row in list(bars)]
+        if len(htf_bars) < max(self.config.htf_fast_sma, self.config.htf_slow_sma) + 5:
+            return "NEUTRAL"
+        closes = [bar["close"] for bar in htf_bars[:-1]]
+        fast = statistics.fmean(closes[-self.config.htf_fast_sma:])
+        slow = statistics.fmean(closes[-self.config.htf_slow_sma:])
+        if fast > slow:
+            return "BULL"
+        if fast < slow:
+            return "BEAR"
+        return "NEUTRAL"
+
+    def _round_to_digits(self, value: float, digits: int) -> float:
+        return round(float(value), digits)
+
+    def _round_volume(self, volume: float, step: float) -> float:
+        if step <= 0:
+            return round(volume, 2)
+        return math.floor(volume / step) * step
+
+    def _clamp(self, value: float, minimum: float, maximum: float) -> float:
+        return max(minimum, min(maximum, value))
+
+    def _result_to_dict(self, result: Any) -> Any:
+        if result is None:
+            return None
+        if hasattr(result, "_asdict"):
+            try:
+                return result._asdict()
+            except Exception:
+                pass
+        return result
+
+    def _cooldown_ok(self, bar_time: dt.datetime) -> bool:
+        if self.state.last_trade_time is None:
+            return True
+        try:
+            last_dt = dt.datetime.fromisoformat(str(self.state.last_trade_time))
+        except Exception:
+            return True
+        elapsed = (bar_time - last_dt).total_seconds()
+        return elapsed >= float(self.config.cooldown_seconds)
+
+    def _max_hold_exceeded(self, pos: PositionState, bar_time: dt.datetime) -> bool:
+        if pos.time_open is None:
+            return False
+        opened = dt.datetime.fromtimestamp(int(pos.time_open))
+        held_minutes = (bar_time - opened).total_seconds() / 60.0
+        return held_minutes >= float(self.config.max_hold_minutes)
+
+    def _sync_closed_trades(self) -> None:
+        from_time = dt.datetime.now() - dt.timedelta(days=30)
+        to_time = dt.datetime.now()
+        try:
+            deals = self.mt5.history_deals_get(from_time, to_time)
+        except Exception:
+            return
+        if not deals:
+            return
+
+        latest_seen = self.state.last_processed_deal_time
+        close_entries = {
+            getattr(self.mt5, "DEAL_ENTRY_OUT", 1),
+            getattr(self.mt5, "DEAL_ENTRY_OUT_BY", 3),
+        }
+
+        for deal in list(deals):
+            deal_time = getattr(deal, "time", None)
+            if deal_time is None:
+                continue
+            deal_iso = dt.datetime.fromtimestamp(int(deal_time)).isoformat()
+            if latest_seen is not None and deal_iso <= latest_seen:
+                continue
+
+            entry = getattr(deal, "entry", None)
+            if entry is not None and entry not in close_entries:
+                continue
+
+            gross_profit = float(getattr(deal, "profit", 0.0))
+            commission = float(getattr(deal, "commission", 0.0))
+            swap = float(getattr(deal, "swap", 0.0))
+            net_profit = gross_profit + commission + swap
+            deal_ticket = getattr(deal, "ticket", 0)
+            order_ticket = getattr(deal, "order", 0)
+            symbol = str(getattr(deal, "symbol", self.symbol))
+
+            self.state.last_close_profit = net_profit
+            self.state.last_processed_deal_time = deal_iso
+            latest_seen = deal_iso
+
+            if net_profit < 0:
+                self.state.consecutive_losses += 1
+            elif net_profit > 0:
+                self.state.consecutive_losses = 0
+                self.state.loss_cooldown_until = None
+                self.state.loss_cooldown_triggered_at = None
+
+            self._log(
+                "Closed deal sync | time=%s deal=%s order=%s symbol=%s entry=%s gross=%.2f commission=%.2f swap=%.2f net=%.2f consecutive_losses=%d",
+                deal_iso,
+                deal_ticket,
+                order_ticket,
+                symbol,
+                entry,
+                gross_profit,
+                commission,
+                swap,
+                net_profit,
+                self.state.consecutive_losses,
+            )
+
+            if self.state.consecutive_losses >= int(self.config.loss_cooldown_losses):
+                deal_dt = dt.datetime.fromtimestamp(int(deal_time))
+                if not self.state.loss_cooldown_until:
+                    self._trigger_loss_cooldown(deal_dt)
+
+        self._save_state()
+
+    def _resolve_timeframe(self, tf: str) -> int:
+        key = tf.strip().upper()
+        mapping = {
+            "M1": self.mt5.TIMEFRAME_M1,
+            "M2": self.mt5.TIMEFRAME_M2,
+            "M3": self.mt5.TIMEFRAME_M3,
+            "M5": self.mt5.TIMEFRAME_M5,
+            "M15": self.mt5.TIMEFRAME_M15,
+            "M30": self.mt5.TIMEFRAME_M30,
+            "H1": self.mt5.TIMEFRAME_H1,
+            "H4": self.mt5.TIMEFRAME_H4,
+            "D1": self.mt5.TIMEFRAME_D1,
+        }
+        if key not in mapping:
+            raise ValueError(f"Unsupported timeframe: {tf}")
+        return mapping[key]
+
+    def _is_transient_ipc_issue(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        keywords = ("broken pipe", "connection reset", "transport", "ipc", "timeout", "dead object")
+        return any(keyword in text for keyword in keywords)
+
+    def _handle_transient_ipc(self, exc: Exception) -> None:
+        self._connect_fail_streak += 1
+        self._log("Transient IPC issue (streak=%s): %s", self._connect_fail_streak, exc)
+        now = time.time()
+        if now - self._last_reconnect_ts < 5:
+            time.sleep(2)
+            return
+        self._last_reconnect_ts = now
+        try:
+            self.mt5.shutdown()
+        except Exception:
+            pass
+        time.sleep(1)
+        self._connect()
+        self._prepare_symbol()
+        self._connect_fail_streak = 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="XAUUSD Momentum Surfer — catch explosive intraday moves.")
+    parser.add_argument("--symbol", default="XAUUSD")
+    parser.add_argument("--timeframe", default="M1")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=18812)
+    parser.add_argument("--live", action="store_true", help="Actually send orders.")
+    parser.add_argument("--start-equity", type=float, default=10000.0)
+    parser.add_argument("--daily-dd-limit", type=float, default=0.03)
+    parser.add_argument("--total-dd-limit", type=float, default=0.05)
+    parser.add_argument("--profit-target", type=float, default=0.15)
+    parser.add_argument("--risk-pct", type=float, default=0.01)
+    parser.add_argument("--max-lots", type=float, default=3.0)
+    parser.add_argument("--max-leverage", type=float, default=10.0)
+    parser.add_argument("--atr-period", type=int, default=14)
+    parser.add_argument("--vol-lookback", type=int, default=50)
+    parser.add_argument("--mom-lookback", type=int, default=3)
+    parser.add_argument("--accel-min", type=float, default=0.80)
+    parser.add_argument("--entry-buffer-atr", type=float, default=0.10)
+    parser.add_argument("--stop-atr", type=float, default=1.80)
+    parser.add_argument("--reward-multiple", type=float, default=3.0)
+    parser.add_argument("--trail-trigger-atr", type=float, default=0.60)
+    parser.add_argument("--trail-lock-atr", type=float, default=0.25)
+    parser.add_argument("--max-spread-points", type=float, default=150.0)
+    parser.add_argument("--max-trades-per-day", type=int, default=10)
+    parser.add_argument("--max-consecutive-losses", type=int, default=5)
+    parser.add_argument("--loss-cooldown-losses", type=int, default=3)
+    parser.add_argument("--loss-cooldown-minutes", type=int, default=15)
+    parser.add_argument("--cooldown-seconds", type=int, default=30)
+    parser.add_argument("--max-hold-minutes", type=int, default=120)
+    parser.add_argument("--loop-seconds", type=int, default=10)
+    parser.add_argument("--lookback-bars", type=int, default=120)
+    parser.add_argument("--htf-timeframe", default="M15")
+    parser.add_argument("--htf-fast-sma", type=int, default=20)
+    parser.add_argument("--htf-slow-sma", type=int, default=50)
+    parser.add_argument("--state-path", default=STATE_PATH_DEFAULT)
+    parser.add_argument("--log-file", default=LOG_PATH_DEFAULT)
+    parser.add_argument(
+        "--terminal-path",
+        default=r"C:\Program Files\MetaTrader 5\terminal64.exe",
+        help="Windows terminal path inside the Wine prefix. Set empty to skip explicit initialize(path=...).",
+    )
+    parser.add_argument("--deviation", type=int, default=30)
+    parser.add_argument("--magic", type=int, default=210511)
+    parser.add_argument("--log-level", default="INFO")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    terminal_path = args.terminal_path.strip() or None
+    config = StrategyConfig(
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        host=args.host,
+        port=args.port,
+        live=bool(args.live),
+        start_equity=float(args.start_equity),
+        daily_dd_limit=float(args.daily_dd_limit),
+        total_dd_limit=float(args.total_dd_limit),
+        profit_target=float(args.profit_target),
+        risk_pct=float(args.risk_pct),
+        max_lots=float(args.max_lots),
+        max_leverage=float(args.max_leverage),
+        atr_period=int(args.atr_period),
+        vol_lookback=int(args.vol_lookback),
+        mom_lookback=int(args.mom_lookback),
+        accel_min=float(args.accel_min),
+        entry_buffer_atr=float(args.entry_buffer_atr),
+        stop_atr=float(args.stop_atr),
+        reward_multiple=float(args.reward_multiple),
+        trail_trigger_atr=float(args.trail_trigger_atr),
+        trail_lock_atr=float(args.trail_lock_atr),
+        max_spread_points=float(args.max_spread_points),
+        max_trades_per_day=int(args.max_trades_per_day),
+        max_consecutive_losses=int(args.max_consecutive_losses),
+        loss_cooldown_losses=int(args.loss_cooldown_losses),
+        loss_cooldown_minutes=int(args.loss_cooldown_minutes),
+        cooldown_seconds=int(args.cooldown_seconds),
+        max_hold_minutes=int(args.max_hold_minutes),
+        loop_seconds=int(args.loop_seconds),
+        lookback_bars=int(args.lookback_bars),
+        htf_timeframe=str(args.htf_timeframe),
+        htf_fast_sma=int(args.htf_fast_sma),
+        htf_slow_sma=int(args.htf_slow_sma),
+        state_path=args.state_path,
+        log_file=args.log_file,
+        terminal_path=terminal_path,
+        deviation=int(args.deviation),
+        magic=int(args.magic),
+        log_level=args.log_level,
+    )
+
+    strategy = XAUUSDMomentumSurferStrategy(config)
+    strategy.run()
+
+
+if __name__ == "__main__":
+    main()
