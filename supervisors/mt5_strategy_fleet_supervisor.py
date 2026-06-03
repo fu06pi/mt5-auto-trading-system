@@ -291,6 +291,8 @@ def _resolve_strategy_specs(plan: Optional[Dict]) -> Tuple[List[Dict], bool]:
             "restart_on_exit": True,
         })
     else:
+        if plan.get("enabled") is False:
+            return [], False
         name = str(plan.get("name", "active"))
         cmd = [str(item) for item in plan.get("cmd", [])]
         log_file = str(plan.get("log_file", ""))
@@ -302,6 +304,8 @@ def _resolve_strategy_specs(plan: Optional[Dict]) -> Tuple[List[Dict], bool]:
             "restart_on_exit": True,
         })
         for comp in plan.get("complementary", []):
+            if comp.get("enabled") is False:
+                continue
             cname = str(comp.get("name", "complementary"))
             ccmd = [str(item) for item in comp.get("cmd", [])]
             clog = str(comp.get("log_file", ""))

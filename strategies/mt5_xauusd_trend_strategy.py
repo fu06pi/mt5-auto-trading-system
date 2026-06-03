@@ -57,8 +57,17 @@ class StrategyConfig:
     htf_fast_sma: int
     htf_slow_sma: int
     trend_threshold: float
+    htf_comp_momentum_threshold: float
+    htf_momentum_bias_weight: float
+    momentum_score_weight: float
     atr_period: int
     breakout_lookback: int
+    enable_false_breakout_reversal: bool
+    false_breakout_direction: str
+    false_breakout_lookback: int
+    false_breakout_min_atr: float
+    false_breakout_close_back_atr: float
+    false_breakout_wick_ratio: float
     stop_atr: float
     reward_multiple: float
     trail_trigger_atr: float
@@ -89,6 +98,7 @@ class StrategyConfig:
     htf_lookback_bars: int
     max_concentration_share: float
     min_positive_days_for_concentration: int
+    allow_pyramiding: bool
     allow_foreign_positions: bool
     state_path: str
     log_file: str
@@ -116,6 +126,8 @@ class MarketSnapshot:
     m15_momentum: float
     score: float
     signal: str
+    false_breakout_signal: str
+    false_breakout_reason: str
 
 
 @dataclasses.dataclass
@@ -339,6 +351,7 @@ class XAUUSDTrendStrategy:
         return (
             "No IPC connection" in text
             or "IPC timeout" in text
+            or "stream has been closed" in text
             or "copy_rates_from_pos returned None" in text
             or "copy_rates_from_pos unavailable" in text
             or "account_info unavailable" in text
@@ -357,6 +370,7 @@ class XAUUSDTrendStrategy:
         except Exception:
             pass
         try:
+            self.mt5 = MetaTrader5(host=self.config.host, port=self.config.port)
             self._connect()
             self._prepare_symbol()
             # Give the terminal a short settle period so bar history is available again
@@ -775,7 +789,10 @@ class XAUUSDTrendStrategy:
 
     def _compensated_htf_signal(self, htf_signal: str, m15_momentum: float) -> str:
         """Use strong M15 momentum to compensate for a lagging H1 filter."""
-        compensation_threshold = max(0.75, float(self.config.trend_threshold) * 2.0)
+        compensation_threshold = max(
+            float(self.config.htf_comp_momentum_threshold),
+            float(self.config.trend_threshold) * 2.0,
+        )
         if m15_momentum >= compensation_threshold:
             return "BULL"
         if m15_momentum <= -compensation_threshold:
@@ -1061,6 +1078,14 @@ class XAUUSDTrendStrategy:
             spread_points,
         )
         signal = self._decide_signal(score, compensated_htf_signal, spread_points)
+        false_breakout_signal, false_breakout_reason = self._false_breakout_reversal_signal(
+            bars[:-1],
+            atr,
+            compensated_htf_signal,
+            spread_points,
+        )
+        if signal == "NONE" and false_breakout_signal != "NONE":
+            signal = false_breakout_signal
 
         return MarketSnapshot(
             bar_time=self._bar_time(last_closed),
@@ -1079,6 +1104,8 @@ class XAUUSDTrendStrategy:
             m15_momentum=m15_momentum,
             score=score,
             signal=signal,
+            false_breakout_signal=false_breakout_signal,
+            false_breakout_reason=false_breakout_reason,
         )
 
     def _fetch_bars(self) -> List[Dict[str, float]]:
@@ -1201,7 +1228,10 @@ class XAUUSDTrendStrategy:
         htf_gap = htf_fast_sma - htf_slow_sma
         htf_gap_strength = self._clamp(htf_gap / max(atr, self._point() * 5), -1.5, 1.5)
         htf_momentum = self._clamp(momentum, -2.0, 2.0)
-        htf_bias = htf_gap_strength * 0.28 + htf_momentum * 0.10
+        htf_bias = (
+            htf_gap_strength * 0.28
+            + htf_momentum * float(self.config.htf_momentum_bias_weight)
+        )
         if htf_signal == "BULL":
             htf_bias = max(htf_bias, 0.22 + max(htf_gap_strength, 0.0) * 0.18)
         elif htf_signal == "BEAR":
@@ -1218,7 +1248,9 @@ class XAUUSDTrendStrategy:
             breakout = self._clamp((last_close - recent_high) / atr, -1.0, 1.0) * 0.30
             breakout += self._clamp((recent_low - last_close) / atr, -1.0, 1.0) * -0.30
 
-        momentum_component = self._clamp(momentum, -1.5, 1.5) * 0.25
+        momentum_component = (
+            self._clamp(momentum, -1.5, 1.5) * float(self.config.momentum_score_weight)
+        )
         spread_penalty = 0.0
         if spread_points > max(self.config.max_spread_points, 0.0):
             spread_penalty = -0.50
@@ -1235,12 +1267,78 @@ class XAUUSDTrendStrategy:
             return "SELL"
         return "NONE"
 
+    def _false_breakout_reversal_signal(
+        self,
+        closed_bars: Sequence[Dict[str, float]],
+        atr: float,
+        htf_signal: str,
+        spread_points: float,
+    ) -> Tuple[str, str]:
+        if not self.config.enable_false_breakout_reversal:
+            return "NONE", "disabled"
+        if spread_points > self.config.max_spread_points:
+            return "NONE", "spread"
+        if atr <= 0:
+            return "NONE", "atr"
+
+        lookback = max(5, int(self.config.false_breakout_lookback))
+        if len(closed_bars) < lookback + 1:
+            return "NONE", "bars"
+
+        last = closed_bars[-1]
+        prior = closed_bars[-lookback - 1:-1]
+        prior_high = max(float(bar["high"]) for bar in prior)
+        prior_low = min(float(bar["low"]) for bar in prior)
+        bar_high = float(last["high"])
+        bar_low = float(last["low"])
+        bar_open = float(last["open"])
+        bar_close = float(last["close"])
+        bar_range = max(bar_high - bar_low, self._point())
+        body_high = max(bar_open, bar_close)
+        body_low = min(bar_open, bar_close)
+        upper_wick_ratio = (bar_high - body_high) / bar_range
+        lower_wick_ratio = (body_low - bar_low) / bar_range
+        min_break = max(0.0, float(self.config.false_breakout_min_atr)) * atr
+        close_back = max(0.0, float(self.config.false_breakout_close_back_atr)) * atr
+        min_wick = max(0.0, float(self.config.false_breakout_wick_ratio))
+        direction_mode = str(self.config.false_breakout_direction).strip().upper()
+
+        upthrust = (
+            bar_high >= prior_high + min_break
+            and bar_close <= prior_high - close_back
+            and upper_wick_ratio >= min_wick
+        )
+        if upthrust and direction_mode in {"SELL", "SELL_ONLY", "BOTH", "ANY"}:
+            if htf_signal == "BEAR":
+                return (
+                    "SELL",
+                    "upthrust high=%.2f prior_high=%.2f close=%.2f wick=%.2f"
+                    % (bar_high, prior_high, bar_close, upper_wick_ratio),
+                )
+            return "NONE", "upthrust_without_bear_htf"
+
+        spring = (
+            bar_low <= prior_low - min_break
+            and bar_close >= prior_low + close_back
+            and lower_wick_ratio >= min_wick
+        )
+        if spring and direction_mode in {"BUY", "BUY_ONLY", "BOTH", "ANY"}:
+            if htf_signal == "BULL":
+                return (
+                    "BUY",
+                    "spring low=%.2f prior_low=%.2f close=%.2f wick=%.2f"
+                    % (bar_low, prior_low, bar_close, lower_wick_ratio),
+                )
+            return "NONE", "spring_without_bull_htf"
+
+        return "NONE", "none"
+
     def _handle_bar(self, snapshot: MarketSnapshot) -> None:
         self._sync_closed_trades()
         positions = self._positions()
         foreign_positions = self._foreign_positions()
         self._log(
-            "Bar %s | close=%.2f atr=%.2f fast=%.2f slow=%.2f htf=%s htf_comp=%s spread=%.1f momentum=%.2f m15_mom=%.2f score=%.2f signal=%s positions=%d foreign=%d trades_today=%d losses=%d",
+            "Bar %s | close=%.2f atr=%.2f fast=%.2f slow=%.2f htf=%s htf_comp=%s spread=%.1f momentum=%.2f m15_mom=%.2f score=%.2f signal=%s fb=%s fb_reason=%s positions=%d foreign=%d trades_today=%d losses=%d",
             snapshot.bar_time,
             snapshot.close,
             snapshot.atr,
@@ -1253,6 +1351,8 @@ class XAUUSDTrendStrategy:
             snapshot.m15_momentum,
             snapshot.score,
             snapshot.signal,
+            snapshot.false_breakout_signal,
+            snapshot.false_breakout_reason,
             len(positions),
             len(foreign_positions),
             self.state.trades_today,
@@ -1307,13 +1407,13 @@ class XAUUSDTrendStrategy:
             return
 
         pos = positions[0]
-        if self._max_hold_exceeded(pos, snapshot.bar_time):
-            self._log("Max holding time exceeded, closing position.")
+        if any(self._max_hold_exceeded(open_pos, snapshot.bar_time) for open_pos in positions):
+            self._log("Max holding time exceeded, closing all owned positions.")
             self.close_all_positions()
             return
 
-        if self._should_reverse(snapshot, pos):
-            self._log("Reverse signal detected, closing current position first.")
+        if any(self._should_reverse(snapshot, open_pos) for open_pos in positions):
+            self._log("Reverse signal detected, closing current owned positions first.")
             self.close_all_positions()
             time.sleep(1)
             if startup_warmup_active:
@@ -1323,7 +1423,18 @@ class XAUUSDTrendStrategy:
                 self._enter(snapshot)
             return
 
-        self._maybe_trail(snapshot, pos)
+        if self.config.allow_pyramiding:
+            current_direction = self._direction_from_position_type(pos.type)
+            if (
+                snapshot.signal == current_direction
+                and self._cooldown_ok(snapshot.bar_time)
+                and not startup_warmup_active
+            ):
+                self._enter(snapshot)
+                return
+
+        for open_pos in positions:
+            self._maybe_trail(snapshot, open_pos)
 
     def _record_startup_warmup_bar(self, snapshot: MarketSnapshot) -> bool:
         warmup_bars = max(0, int(self.config.startup_warmup_bars))
@@ -1342,11 +1453,20 @@ class XAUUSDTrendStrategy:
 
     def _all_positions(self) -> List[PositionState]:
         raw = self.mt5.positions_get(symbol=self.symbol)
-        if not raw:
+        if raw is None:
             raw, error = self._positions_once()
-            if not raw:
+            if raw is None:
                 if error is not None:
                     self._log("positions_get unavailable through fresh client: %s", error)
+                return []
+        if len(raw) == 0:
+            fresh_raw, error = self._positions_once()
+            if fresh_raw is None:
+                if error is not None:
+                    self._log("positions_get empty and fresh client unavailable: %s", error)
+                return []
+            raw = fresh_raw
+            if len(raw) == 0:
                 return []
         out: List[PositionState] = []
         for pos in raw:
@@ -1413,7 +1533,8 @@ class XAUUSDTrendStrategy:
         snapshot = self._build_snapshot()
         if snapshot is None or snapshot.atr <= 0:
             return
-        self._maybe_trail(snapshot, positions[0])
+        for pos in positions:
+            self._maybe_trail(snapshot, pos)
 
     def _maybe_auto_half_close_on_loop(self) -> None:
         """Check profit-protection on every loop, not only on new M5 bars.
@@ -1633,7 +1754,8 @@ class XAUUSDTrendStrategy:
         sl, tp = self._build_sl_tp(direction, price, snapshot.atr)
         volume = self._size_position(direction, price, sl)
         if volume <= 0:
-            raise RuntimeError("Calculated volume is zero")
+            self._log("Calculated volume is zero; skip entry.")
+            return
 
         request = self._order_request(direction, volume, price, sl, tp)
         self._log(
@@ -1697,7 +1819,17 @@ class XAUUSDTrendStrategy:
             raise RuntimeError("risk_per_lot invalid")
 
         lot_cap = float(self.config.max_lots)
+        owned_volume = sum(max(0.0, float(pos.volume)) for pos in self._positions())
+        remaining_lot_cap = max(0.0, lot_cap - owned_volume)
+        if remaining_lot_cap <= 0:
+            self._log(
+                "Total lot cap reached: owned=%.2f max=%.2f; skip additional entry.",
+                owned_volume,
+                lot_cap,
+            )
+            return 0.0
         per_order_cap = float(self.config.max_lots_per_order)
+        lot_cap = remaining_lot_cap
         if per_order_cap > 0:
             lot_cap = min(lot_cap, per_order_cap)
 
@@ -1974,8 +2106,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--htf-fast-sma", type=int, default=50)
     parser.add_argument("--htf-slow-sma", type=int, default=200)
     parser.add_argument("--trend-threshold", type=float, default=0.35)
+    parser.add_argument(
+        "--htf-comp-momentum-threshold",
+        type=float,
+        default=0.75,
+        help="Minimum absolute M15 momentum needed to override/compensate the raw H1 HTF filter.",
+    )
+    parser.add_argument(
+        "--htf-momentum-bias-weight",
+        type=float,
+        default=0.10,
+        help="Weight of short-term momentum inside the HTF bias score component.",
+    )
+    parser.add_argument(
+        "--momentum-score-weight",
+        type=float,
+        default=0.25,
+        help="Weight of M5 momentum in the final signal score.",
+    )
     parser.add_argument("--atr-period", type=int, default=14)
     parser.add_argument("--breakout-lookback", type=int, default=20)
+    parser.add_argument(
+        "--enable-false-breakout-reversal",
+        action="store_true",
+        help="Enable sharp false-breakout reversal overlay. Default is disabled.",
+    )
+    parser.add_argument(
+        "--false-breakout-direction",
+        default="SELL_ONLY",
+        choices=["SELL_ONLY", "BUY_ONLY", "BOTH", "ANY", "SELL", "BUY"],
+        help="Allowed overlay direction. Research edge currently supports SELL_ONLY best.",
+    )
+    parser.add_argument("--false-breakout-lookback", type=int, default=20)
+    parser.add_argument("--false-breakout-min-atr", type=float, default=0.15)
+    parser.add_argument("--false-breakout-close-back-atr", type=float, default=0.05)
+    parser.add_argument("--false-breakout-wick-ratio", type=float, default=0.45)
     parser.add_argument("--stop-atr", type=float, default=2.5)
     parser.add_argument("--reward-multiple", type=float, default=2.5)
     parser.add_argument("--trail-trigger-atr", type=float, default=1.5)
@@ -2067,6 +2232,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-concentration-share", type=float, default=0.45)
     parser.add_argument("--min-positive-days-for-concentration", type=int, default=3)
     parser.add_argument(
+        "--allow-pyramiding",
+        action="store_true",
+        help="Allow same-direction add-on entries while owned positions exist, bounded by max-lots and per-order cap.",
+    )
+    parser.add_argument(
         "--allow-foreign-positions",
         action="store_true",
         help="Allow new strategy entries even if same-symbol positions with a different magic number exist.",
@@ -2111,8 +2281,17 @@ def main() -> None:
         htf_fast_sma=int(args.htf_fast_sma),
         htf_slow_sma=int(args.htf_slow_sma),
         trend_threshold=float(args.trend_threshold),
+        htf_comp_momentum_threshold=float(args.htf_comp_momentum_threshold),
+        htf_momentum_bias_weight=float(args.htf_momentum_bias_weight),
+        momentum_score_weight=float(args.momentum_score_weight),
         atr_period=int(args.atr_period),
         breakout_lookback=int(args.breakout_lookback),
+        enable_false_breakout_reversal=bool(args.enable_false_breakout_reversal),
+        false_breakout_direction=str(args.false_breakout_direction),
+        false_breakout_lookback=int(args.false_breakout_lookback),
+        false_breakout_min_atr=float(args.false_breakout_min_atr),
+        false_breakout_close_back_atr=float(args.false_breakout_close_back_atr),
+        false_breakout_wick_ratio=float(args.false_breakout_wick_ratio),
         stop_atr=float(args.stop_atr),
         reward_multiple=float(args.reward_multiple),
         trail_trigger_atr=float(args.trail_trigger_atr),
@@ -2143,6 +2322,7 @@ def main() -> None:
         htf_lookback_bars=int(args.htf_lookback_bars),
         max_concentration_share=float(args.max_concentration_share),
         min_positive_days_for_concentration=int(args.min_positive_days_for_concentration),
+        allow_pyramiding=bool(args.allow_pyramiding),
         allow_foreign_positions=bool(args.allow_foreign_positions),
         state_path=args.state_path,
         log_file=args.log_file,

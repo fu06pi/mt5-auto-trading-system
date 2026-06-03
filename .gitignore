@@ -31,6 +31,7 @@ auto_quant/backups/
 auto_quant/logs/
 auto_quant/output/
 auto_quant/plans/
+auto_quant/test_plans/
 auto_quant/*.json
 auto_quant/*.bak*
 auto_quant/*baseline*.json
@@ -76,3 +77,4 @@ Thumbs.db
 .idea/
 .vscode/
 .history/
+.hermes/
