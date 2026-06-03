@@ -1,0 +1,39 @@
+{
+  "base_only": {
+    "trades": 1223,
+    "net": 38808.87,
+    "win_rate": 35.4,
+    "pf": 1.109,
+    "avg": 31.73,
+    "loss_trades": 790,
+    "win_trades": 433
+  },
+  "pause_only": {
+    "trades": 1094,
+    "net": 43380.89,
+    "win_rate": 35.74,
+    "pf": 1.139,
+    "avg": 39.65,
+    "loss_trades": 703,
+    "win_trades": 391
+  },
+  "common_baseline": {
+    "trades": 1409,
+    "net": 16302.56,
+    "win_rate": 34.71,
+    "pf": 1.04,
+    "avg": 11.57,
+    "loss_trades": 920,
+    "win_trades": 489
+  },
+  "common_pause": {
+    "trades": 1409,
+    "net": 15588.14,
+    "win_rate": 34.71,
+    "pf": 1.038,
+    "avg": 11.06,
+    "loss_trades": 920,
+    "win_trades": 489
+  },
+  "delta_pause_only_minus_base_only": 4572.03
+}

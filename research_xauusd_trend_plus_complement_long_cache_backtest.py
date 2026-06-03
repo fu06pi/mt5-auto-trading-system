@@ -97,9 +97,24 @@ def main() -> None:
     m15_bars = aggregate_bars(m5_bars, 15)
     variants = [
         Params(name="current_trend_only_long", mode="trend_only"),
+        Params(
+            name="current_trend_only_chop_conservative_long",
+            mode="trend_only",
+            chop_gate="conservative_session",
+        ),
         Params(name="complement_fb_sell_only_long", mode="complement_only"),
         Params(name="current_trend_plus_complement_long", mode="trend_plus_complement"),
+        Params(
+            name="current_trend_plus_complement_chop_conservative_long",
+            mode="trend_plus_complement",
+            chop_gate="conservative_session",
+        ),
         Params(name="parallel_independent_sleeves_long", mode="parallel_sleeves"),
+        Params(
+            name="parallel_independent_sleeves_chop_conservative_long",
+            mode="parallel_sleeves",
+            chop_gate="conservative_session",
+        ),
     ]
     summary_rows: List[dict] = []
     all_trades = []

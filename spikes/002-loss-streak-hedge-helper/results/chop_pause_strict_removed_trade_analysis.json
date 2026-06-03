@@ -1,0 +1,233 @@
+{
+  "baseline": {
+    "trades": 2632,
+    "net_pnl": 55111.43,
+    "return_pct": 55.11,
+    "win_rate_pct": 35.03,
+    "profit_factor": 1.072,
+    "max_dd_pct": -13.1,
+    "expectancy_usd": 20.94,
+    "avg_r": 0.088,
+    "approx_sharpe_per_trade": 1.576
+  },
+  "strict_pause": {
+    "trades": 2503,
+    "net_pnl": 58969.03,
+    "return_pct": 58.97,
+    "win_rate_pct": 35.16,
+    "profit_factor": 1.081,
+    "max_dd_pct": -11.47,
+    "expectancy_usd": 23.56,
+    "avg_r": 0.093,
+    "approx_sharpe_per_trade": 1.729
+  },
+  "removed": {
+    "trades": 1223,
+    "net": 38808.87,
+    "win_rate": 35.4,
+    "pf": 1.109,
+    "avg": 31.73,
+    "loss_trades": 790,
+    "win_trades": 433
+  },
+  "kept_baseline_subset": {
+    "trades": 1409,
+    "net": 16302.56,
+    "win_rate": 34.71,
+    "pf": 1.04,
+    "avg": 11.57,
+    "loss_trades": 920,
+    "win_trades": 489
+  },
+  "removed_by_side": {
+    "BUY": {
+      "trades": 671,
+      "net": 40792.02,
+      "win_rate": 38.0,
+      "pf": 1.219,
+      "avg": 60.79,
+      "loss_trades": 416,
+      "win_trades": 255
+    },
+    "SELL": {
+      "trades": 552,
+      "net": -1983.15,
+      "win_rate": 32.25,
+      "pf": 0.988,
+      "avg": -3.59,
+      "loss_trades": 374,
+      "win_trades": 178
+    }
+  },
+  "removed_by_session": {
+    "late_us": {
+      "trades": 118,
+      "net": 11945.64,
+      "win_rate": 40.68,
+      "pf": 1.367,
+      "avg": 101.23,
+      "loss_trades": 70,
+      "win_trades": 48
+    },
+    "asia": {
+      "trades": 419,
+      "net": -4980.5,
+      "win_rate": 32.46,
+      "pf": 0.961,
+      "avg": -11.89,
+      "loss_trades": 283,
+      "win_trades": 136
+    },
+    "us_london_overlap": {
+      "trades": 381,
+      "net": 20237.8,
+      "win_rate": 39.37,
+      "pf": 1.193,
+      "avg": 53.12,
+      "loss_trades": 231,
+      "win_trades": 150
+    },
+    "london_pre_us": {
+      "trades": 305,
+      "net": 11605.93,
+      "win_rate": 32.46,
+      "pf": 1.126,
+      "avg": 38.05,
+      "loss_trades": 206,
+      "win_trades": 99
+    }
+  },
+  "removed_by_reason": {
+    "SL": {
+      "trades": 764,
+      "net": -352403.02,
+      "win_rate": 0.0,
+      "pf": 0.0,
+      "avg": -461.26,
+      "loss_trades": 764,
+      "win_trades": 0
+    },
+    "TIME": {
+      "trades": 128,
+      "net": 35860.01,
+      "win_rate": 79.69,
+      "pf": 10.525,
+      "avg": 280.16,
+      "loss_trades": 26,
+      "win_trades": 102
+    },
+    "TP": {
+      "trades": 331,
+      "net": 355351.88,
+      "win_rate": 100.0,
+      "pf": 999,
+      "avg": 1073.57,
+      "loss_trades": 0,
+      "win_trades": 331
+    }
+  },
+  "worst_removed_weeks": [
+    {
+      "week": "2025-W31",
+      "removed_net": -5029.85,
+      "removed_trades": 31
+    },
+    {
+      "week": "2026-W07",
+      "removed_net": -4600.24,
+      "removed_trades": 20
+    },
+    {
+      "week": "2025-W43",
+      "removed_net": -4364.84,
+      "removed_trades": 16
+    },
+    {
+      "week": "2025-W33",
+      "removed_net": -3911.19,
+      "removed_trades": 19
+    },
+    {
+      "week": "2025-W45",
+      "removed_net": -3453.26,
+      "removed_trades": 21
+    },
+    {
+      "week": "2025-W26",
+      "removed_net": -2937.35,
+      "removed_trades": 21
+    },
+    {
+      "week": "2025-W48",
+      "removed_net": -2917.09,
+      "removed_trades": 10
+    },
+    {
+      "week": "2026-W08",
+      "removed_net": -2598.17,
+      "removed_trades": 15
+    },
+    {
+      "week": "2026-W16",
+      "removed_net": -2544.36,
+      "removed_trades": 16
+    },
+    {
+      "week": "2026-W19",
+      "removed_net": -2541.11,
+      "removed_trades": 8
+    }
+  ],
+  "best_removed_weeks": [
+    {
+      "week": "2025-W22",
+      "removed_net": 3794.26,
+      "removed_trades": 16
+    },
+    {
+      "week": "2025-W40",
+      "removed_net": 3860.99,
+      "removed_trades": 12
+    },
+    {
+      "week": "2025-W06",
+      "removed_net": 3925.3,
+      "removed_trades": 11
+    },
+    {
+      "week": "2025-W52",
+      "removed_net": 4461.01,
+      "removed_trades": 25
+    },
+    {
+      "week": "2025-W38",
+      "removed_net": 4474.96,
+      "removed_trades": 18
+    },
+    {
+      "week": "2026-W01",
+      "removed_net": 4800.32,
+      "removed_trades": 24
+    },
+    {
+      "week": "2026-W04",
+      "removed_net": 5111.41,
+      "removed_trades": 23
+    },
+    {
+      "week": "2026-W10",
+      "removed_net": 5136.42,
+      "removed_trades": 11
+    },
+    {
+      "week": "2025-W17",
+      "removed_net": 6214.45,
+      "removed_trades": 20
+    },
+    {
+      "week": "2025-W34",
+      "removed_net": 8118.88,
+      "removed_trades": 20
+    }
+  ]
+}

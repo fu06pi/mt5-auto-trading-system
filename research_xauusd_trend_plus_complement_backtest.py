@@ -14,7 +14,7 @@ import math
 import statistics
 import sys
 from bisect import bisect_right
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -27,7 +27,7 @@ except ImportError:
 ROOT = Path("/home/chain4655/Documents/Projects/MT5")
 OUT_DIR = ROOT / "backtest_reports_trend_plus_complement"
 SYMBOL = "XAUUSD"
-INITIAL_EQUITY = 10000.0
+INITIAL_EQUITY = 100000.0
 CONTRACT_SIZE = 100.0
 POINT = 0.01
 SPREAD_POINTS = 20.0
@@ -70,6 +70,15 @@ class Params:
     fb_min_atr: float = 0.15
     fb_close_back_atr: float = 0.05
     fb_wick_ratio: float = 0.45
+    chop_gate: str = "none"  # none, conservative_session
+    chop_adx_max: float = 18.0
+    chop_efficiency_max: float = 0.18
+    chop_atr_ratio_max: float = 0.85
+    chop_slope_atr_max: float = 1.00
+    chop_alternation_min: float = 0.55
+    chop_min_score: float = 0.65
+    chop_min_points: int = 3
+    chop_non_asia_risk_mult: float = 0.25
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,6 +125,13 @@ class Trade:
     session: str
 
 
+@dataclasses.dataclass(frozen=True)
+class ChopState:
+    is_chop: bool
+    points: int
+    reason: str
+
+
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
@@ -126,6 +142,108 @@ def mean(values: Sequence[float]) -> float:
 
 def stdev(values: Sequence[float]) -> float:
     return statistics.pstdev(values) if len(values) > 1 else 0.0
+
+
+def true_ranges(bars: Sequence[Bar]) -> List[float]:
+    out: List[float] = []
+    for i in range(1, len(bars)):
+        curr = bars[i]
+        prev = bars[i - 1]
+        out.append(max(curr.high - curr.low, abs(curr.high - prev.close), abs(curr.low - prev.close)))
+    return out
+
+
+def calculate_adx(bars: Sequence[Bar], period: int = 14) -> float:
+    if len(bars) < period * 2 + 2:
+        return 50.0
+    plus_dm: List[float] = []
+    minus_dm: List[float] = []
+    trs: List[float] = []
+    for i in range(1, len(bars)):
+        up_move = bars[i].high - bars[i - 1].high
+        down_move = bars[i - 1].low - bars[i].low
+        plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0.0)
+        minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0.0)
+        trs.append(max(bars[i].high - bars[i].low, abs(bars[i].high - bars[i - 1].close), abs(bars[i].low - bars[i - 1].close)))
+    dxs: List[float] = []
+    for j in range(period, len(trs) + 1):
+        tr_sum = sum(trs[j - period:j])
+        if tr_sum <= 0:
+            continue
+        plus_di = 100.0 * sum(plus_dm[j - period:j]) / tr_sum
+        minus_di = 100.0 * sum(minus_dm[j - period:j]) / tr_sum
+        denom = plus_di + minus_di
+        if denom <= 0:
+            continue
+        dxs.append(100.0 * abs(plus_di - minus_di) / denom)
+    return mean(dxs[-period:]) if dxs else 50.0
+
+
+def range_efficiency(bars: Sequence[Bar], window: int = 48) -> float:
+    if len(bars) < window + 1:
+        return 1.0
+    recent = bars[-window - 1:]
+    net_move = abs(recent[-1].close - recent[0].close)
+    path = sum(abs(recent[i].close - recent[i - 1].close) for i in range(1, len(recent)))
+    return net_move / max(path, POINT)
+
+
+def atr_ratio(bars: Sequence[Bar], short_period: int = 14, long_period: int = 96) -> float:
+    trs = true_ranges(bars)
+    if len(trs) < long_period:
+        return 1.0
+    short_atr = mean(trs[-short_period:])
+    long_atr = mean(trs[-long_period:])
+    return short_atr / max(long_atr, POINT)
+
+
+def alternating_signal_rate(signals: Sequence[str]) -> float:
+    directional = [sig for sig in signals if sig in {"BUY", "SELL"}]
+    if len(directional) < 4:
+        return 0.0
+    flips = sum(1 for i in range(1, len(directional)) if directional[i] != directional[i - 1])
+    return flips / max(len(directional) - 1, 1)
+
+
+def detect_chop(hist: Sequence[Bar], snap: Snapshot, recent_signals: Sequence[str], params: Params) -> ChopState:
+    closes = [bar.close for bar in hist]
+    fast = mean(closes[-params.fast_sma:])
+    slow = mean(closes[-params.slow_sma:])
+    adx = calculate_adx(hist[-120:], 14)
+    efficiency = range_efficiency(hist, 48)
+    ratio = atr_ratio(hist, 14, 96)
+    slope_atr = abs(fast - slow) / max(snap.atr, POINT)
+    alternation = alternating_signal_rate(recent_signals[-36:])
+
+    points = 0
+    reasons: List[str] = []
+    if adx <= params.chop_adx_max:
+        points += 1
+        reasons.append("adx")
+    if efficiency <= params.chop_efficiency_max:
+        points += 1
+        reasons.append("efficiency")
+    if ratio <= params.chop_atr_ratio_max:
+        points += 1
+        reasons.append("atr_compression")
+    if slope_atr <= params.chop_slope_atr_max:
+        points += 1
+        reasons.append("flat_sma")
+    if alternation >= params.chop_alternation_min:
+        points += 1
+        reasons.append("alternating_signals")
+    if abs(float(snap.score)) <= params.chop_min_score:
+        points += 1
+        reasons.append("weak_score")
+    return ChopState(points >= params.chop_min_points, points, "+".join(reasons) or "none")
+
+
+def trend_risk_multiplier(chop: ChopState, snap: Snapshot, params: Params) -> float:
+    if params.chop_gate != "conservative_session" or not chop.is_chop:
+        return 1.0
+    if snap.session == "asia":
+        return 0.0
+    return params.chop_non_asia_risk_mult
 
 
 def fetch_bars(timeframe: str, count: int) -> List[Bar]:
@@ -385,6 +503,7 @@ def backtest(
     h1_times = [bar.time for bar in h1_bars]
     m15_times = [bar.time for bar in m15_bars]
     h1_cache: Dict[int, Tuple[float, float, str]] = {}
+    recent_signals: deque[str] = deque(maxlen=48)
     warmup = max(260, params.slow_sma + params.breakout_lookback + params.atr_period + 5)
 
     for i in range(warmup, len(m5_bars) - 1):
@@ -393,6 +512,11 @@ def backtest(
         if snap is None:
             continue
         snapshots += 1
+        recent_signals.append(snap.primary_signal)
+        chop = detect_chop(hist, snap, list(recent_signals), params)
+        if chop.is_chop:
+            signal_counts["chop_bars"] += 1
+            signal_counts[f"chop_reason_{chop.reason}"] += 1
         signal_counts[f"primary_{snap.primary_signal}"] += 1
         signal_counts[f"complement_{snap.complement_signal}"] += 1
         signal_counts[f"final_{snap.signal_source}"] += 1
@@ -453,17 +577,41 @@ def backtest(
                 position = None
                 cooldown_until = i + params.cooldown_bars
 
-        if position is None and i >= cooldown_until and snap.final_signal in {"BUY", "SELL"}:
+        entry_signal = snap.final_signal
+        entry_source = snap.signal_source
+        risk_mult = 1.0
+        if entry_source == "trend" and entry_signal in {"BUY", "SELL"}:
+            risk_mult = trend_risk_multiplier(chop, snap, params)
+            if risk_mult <= 0.0:
+                signal_counts["trend_paused_asia_chop"] += 1
+                if params.mode == "trend_plus_complement" and snap.complement_signal in {"BUY", "SELL"}:
+                    entry_signal = snap.complement_signal
+                    entry_source = "complement"
+                    risk_mult = 1.0
+                    signal_counts["complement_filled_after_trend_pause"] += 1
+                else:
+                    entry_signal = "NONE"
+                    entry_source = "none"
+            elif risk_mult < 1.0:
+                signal_counts["trend_scaled_non_asia_chop"] += 1
+                signal_counts[f"trend_scaled_{snap.session}_chop"] += 1
+
+        if position is None and i >= cooldown_until and entry_signal in {"BUY", "SELL"}:
             entry = nxt.open
             sl_dist = snap.atr * params.stop_atr
             tp_dist = sl_dist * params.reward_multiple
-            sl = entry - sl_dist if snap.final_signal == "BUY" else entry + sl_dist
-            tp = entry + tp_dist if snap.final_signal == "BUY" else entry - tp_dist
-            volume = position_size(equity, params, entry, sl)
+            sl = entry - sl_dist if entry_signal == "BUY" else entry + sl_dist
+            tp = entry + tp_dist if entry_signal == "BUY" else entry - tp_dist
+            sized_params = dataclasses.replace(
+                params,
+                risk_pct=params.risk_pct * risk_mult,
+                max_lots=params.max_lots * risk_mult,
+            )
+            volume = position_size(equity, sized_params, entry, sl)
             if volume > 0:
                 position = {
-                    "side": snap.final_signal,
-                    "signal_source": snap.signal_source,
+                    "side": entry_signal,
+                    "signal_source": entry_source,
                     "entry": entry,
                     "sl": sl,
                     "orig_sl": sl,
@@ -502,6 +650,7 @@ def backtest_parallel_sleeves(
     h1_times = [bar.time for bar in h1_bars]
     m15_times = [bar.time for bar in m15_bars]
     h1_cache: Dict[int, Tuple[float, float, str]] = {}
+    recent_signals: deque[str] = deque(maxlen=48)
     warmup = max(260, params.slow_sma + params.breakout_lookback + params.atr_period + 5)
 
     def close_position(source: str, pos: Dict[str, Any], i: int, nxt: Bar) -> Optional[Dict[str, Any]]:
@@ -562,6 +711,11 @@ def backtest_parallel_sleeves(
         if snap is None:
             continue
         snapshots += 1
+        recent_signals.append(snap.primary_signal)
+        chop = detect_chop(hist, snap, list(recent_signals), params)
+        if chop.is_chop:
+            signal_counts["chop_bars"] += 1
+            signal_counts[f"chop_reason_{chop.reason}"] += 1
         signal_counts[f"primary_{snap.primary_signal}"] += 1
         signal_counts[f"complement_{snap.complement_signal}"] += 1
         nxt = m5_bars[i + 1]
@@ -585,12 +739,26 @@ def backtest_parallel_sleeves(
         for source, signal in entries:
             if positions[source] is not None or i < cooldown_until[source] or signal not in {"BUY", "SELL"}:
                 continue
+            risk_mult = 1.0
+            if source == "trend":
+                risk_mult = trend_risk_multiplier(chop, snap, params)
+                if risk_mult <= 0.0:
+                    signal_counts["trend_paused_asia_chop"] += 1
+                    continue
+                if risk_mult < 1.0:
+                    signal_counts["trend_scaled_non_asia_chop"] += 1
+                    signal_counts[f"trend_scaled_{snap.session}_chop"] += 1
             entry = nxt.open
             sl_dist = snap.atr * params.stop_atr
             tp_dist = sl_dist * params.reward_multiple
             sl = entry - sl_dist if signal == "BUY" else entry + sl_dist
             tp = entry + tp_dist if signal == "BUY" else entry - tp_dist
-            volume = position_size(equity, params, entry, sl)
+            sized_params = dataclasses.replace(
+                params,
+                risk_pct=params.risk_pct * risk_mult,
+                max_lots=params.max_lots * risk_mult,
+            )
+            volume = position_size(equity, sized_params, entry, sl)
             if volume <= 0:
                 continue
             positions[source] = {
@@ -656,9 +824,20 @@ def main() -> None:
     m15_bars = fetch_bars("M15", MAX_M5_BARS)
     variants = [
         Params(name="current_trend_only", mode="trend_only"),
+        Params(name="current_trend_only_chop_conservative", mode="trend_only", chop_gate="conservative_session"),
         Params(name="complement_fb_sell_only", mode="complement_only"),
         Params(name="current_trend_plus_complement", mode="trend_plus_complement"),
+        Params(
+            name="current_trend_plus_complement_chop_conservative",
+            mode="trend_plus_complement",
+            chop_gate="conservative_session",
+        ),
         Params(name="parallel_independent_sleeves", mode="parallel_sleeves"),
+        Params(
+            name="parallel_independent_sleeves_chop_conservative",
+            mode="parallel_sleeves",
+            chop_gate="conservative_session",
+        ),
     ]
     summary_rows: List[Dict[str, Any]] = []
     all_trades: List[Trade] = []
