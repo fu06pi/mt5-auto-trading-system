@@ -268,6 +268,7 @@ def _load_active_plan() -> Optional[Dict[str, object]]:
         "mt5_doomsday_strategy.py",
         "mt5_doomsday_v4_strategy.py",
         "mt5_xauusd_10d_breakout_strategy.py",
+        "mt5_xauusd_asian_reversal_strategy.py",
         "mt5_xauusd_momentum_surfer_strategy.py",
         "mt5_xauusd_trend_strategy.py",
     }

@@ -13,7 +13,7 @@ import json
 import math
 import statistics
 import sys
-from bisect import bisect_right
+from bisect import bisect_left
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -300,7 +300,11 @@ def htf_context(
     bars: Sequence[Bar], times: Sequence[dt.datetime], ts: dt.datetime, params: Params,
     cache: Dict[int, Tuple[float, float, str]],
 ) -> Tuple[float, float, str]:
-    idx = bisect_right(times, ts.replace(minute=0, second=0, microsecond=0)) - 1
+    # Match live strategy behavior: MT5 returns the current forming H1 bar, and
+    # live excludes it with htf_bars[:-1].  For a closed M5 bar at ts, only H1
+    # bars with open time strictly before the current hour are fully closed.
+    hour_floor = ts.replace(minute=0, second=0, microsecond=0)
+    idx = bisect_left(times, hour_floor) - 1
     if idx in cache:
         return cache[idx]
     if idx < params.htf_slow_sma:
@@ -327,7 +331,10 @@ def htf_context(
 def m15_momentum(
     m15_bars: Sequence[Bar], m15_times: Sequence[dt.datetime], ts: dt.datetime, atr_ref: float,
 ) -> float:
-    idx = bisect_right(m15_times, ts.replace(second=0, microsecond=0)) - 1
+    # Match live strategy behavior: exclude the current forming M15 bar.
+    minute_floor = (ts.minute // 15) * 15
+    m15_floor = ts.replace(minute=minute_floor, second=0, microsecond=0)
+    idx = bisect_left(m15_times, m15_floor) - 1
     if idx < 4 or atr_ref <= 0:
         return 0.0
     closes = [bar.close for bar in m15_bars[max(0, idx - 20) : idx + 1]]

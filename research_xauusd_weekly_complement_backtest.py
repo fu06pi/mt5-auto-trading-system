@@ -133,9 +133,24 @@ def main() -> None:
 
     variants = [
         Params(name="current_trend_only_weekly", mode="trend_only"),
+        Params(
+            name="current_trend_only_chop_conservative_weekly",
+            mode="trend_only",
+            chop_gate="conservative_session",
+        ),
         Params(name="complement_fb_sell_only_weekly", mode="complement_only"),
         Params(name="current_trend_plus_complement_overlay_weekly", mode="trend_plus_complement"),
+        Params(
+            name="current_trend_plus_complement_chop_conservative_weekly",
+            mode="trend_plus_complement",
+            chop_gate="conservative_session",
+        ),
         Params(name="parallel_independent_sleeves_weekly", mode="parallel_sleeves"),
+        Params(
+            name="parallel_independent_sleeves_chop_conservative_weekly",
+            mode="parallel_sleeves",
+            chop_gate="conservative_session",
+        ),
     ]
 
     all_weekly_rows: List[Dict[str, Any]] = []
