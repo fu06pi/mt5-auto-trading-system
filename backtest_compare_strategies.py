@@ -10,8 +10,6 @@ import statistics
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
-
 try:
     from pymt5linux import MetaTrader5
 except ImportError:  # allow running with system python by falling back to known venv
@@ -378,10 +376,10 @@ class AsiaLondonBreakoutStrategy(BaseStrategy):
 
 class MomentumSurferStrategy(BaseStrategy):
     name = "momentum_surfer"
-    risk_pct = 0.01
-    stop_atr = 2.5
-    reward_multiple = 3.0
-    threshold = 0.80
+    risk_pct = 0.0020
+    stop_atr = 1.80
+    reward_multiple = 2.5
+    threshold = 0.95
     atr_period = 14
     mom_lookback = 3
     vol_lookback = 50

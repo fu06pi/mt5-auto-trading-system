@@ -14,13 +14,14 @@ from typing import Iterable, List, Optional
 ROOT = Path("/home/chain4655/Documents/Projects/MT5")
 WINEPREFIX = "/home/chain4655/.mt5"
 TERMINAL_EXE = "/home/chain4655/.mt5/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-SUPERVISOR = ROOT / "supervisors" / "mt5_bridge_supervisor.py"
+SUPERVISOR = ROOT / "supervisors" / "mt5_strategy_fleet_supervisor.py"
 PORT = 18812
 
 PATTERNS = [
     "mt5_xauusd_momentum_surfer_strategy.py",
     "mt5_xauusd_asian_reversal_strategy.py",
     "mt5_doomsday_strategy.py",
+    "mt5_strategy_fleet_supervisor.py",
     "mt5_bridge_supervisor.py",
     "pymt5linux",
     "tmp\\pymt5linux\\server.py",
@@ -167,7 +168,7 @@ if ok:
 
 
 def start_supervisor() -> subprocess.Popen[bytes]:
-    print("[5/5] start bridge supervisor")
+    print("[5/5] start fleet supervisor")
     proc = subprocess.Popen(
         ["python3.14", str(SUPERVISOR)],
         cwd=str(ROOT),

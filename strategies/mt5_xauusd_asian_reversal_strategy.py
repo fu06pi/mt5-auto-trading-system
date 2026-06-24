@@ -141,11 +141,28 @@ class XAUUSDAsianReversalStrategy:
         self._pivot_high_idx: int = -1
         self._pivot_low_idx: int = -1
         self._last_trade_day: Optional[str] = None
+        self._connect_fail_streak = 0
+        self._last_reconnect_ts = 0.0
 
         # Resolve timeframe seconds
         tf_map = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600}
         self._tf_seconds = next((v for k, v in tf_map.items() if k.upper() == config.timeframe.upper()), 60)
         self._loop_start = time.time()
+
+    def _mt5_timestamp_to_chart_time(self, timestamp: int) -> dt.datetime:
+        """Convert MT5 epoch seconds to naive broker chart/server time."""
+        return dt.datetime.fromtimestamp(int(timestamp), dt.UTC).replace(tzinfo=None)
+
+    def _chart_now(self) -> dt.datetime:
+        """Return naive MT5 chart/server time for cooldown/state comparisons."""
+        try:
+            tick = self.mt5.symbol_info_tick(self.config.symbol)
+            tick_time = int(getattr(tick, "time", 0) or 0) if tick is not None else 0
+            if tick_time > 0:
+                return self._mt5_timestamp_to_chart_time(tick_time)
+        except Exception:
+            pass
+        return dt.datetime.now(dt.UTC).replace(tzinfo=None)
 
     # ── Pivot Detection ──────────────────────────────────────────────
 
@@ -366,7 +383,18 @@ class XAUUSDAsianReversalStrategy:
     def _loss_cooldown_active(self) -> bool:
         if self.state.loss_cooldown_until is None:
             return False
-        return dt.datetime.now().isoformat() < self.state.loss_cooldown_until
+        try:
+            until = dt.datetime.fromisoformat(str(self.state.loss_cooldown_until))
+        except ValueError:
+            self.state.loss_cooldown_until = None
+            self._save_state()
+            return False
+        current = self._chart_now()
+        if current < until:
+            return True
+        self.state.loss_cooldown_until = None
+        self._save_state()
+        return False
 
     # ── Position Management ──────────────────────────────────────────
 
@@ -402,8 +430,8 @@ class XAUUSDAsianReversalStrategy:
 
     def _sync_closed_trades(self) -> None:
         self._ensure_mt5()
-        from_time = dt.datetime.now() - dt.timedelta(days=30)
-        to_time = dt.datetime.now()
+        to_time = self._chart_now()
+        from_time = to_time - dt.timedelta(days=30)
         try:
             deals = self.mt5.history_deals_get(from_time, to_time)
         except Exception:
@@ -416,7 +444,8 @@ class XAUUSDAsianReversalStrategy:
             deal_time = getattr(deal, "time", None)
             if deal_time is None:
                 continue
-            deal_iso = dt.datetime.fromtimestamp(int(deal_time), dt.UTC).replace(tzinfo=None).isoformat()
+            deal_dt = self._mt5_timestamp_to_chart_time(int(deal_time))
+            deal_iso = deal_dt.isoformat()
             if latest_seen is not None and deal_iso <= latest_seen:
                 continue
             if not self._is_owned_closing_deal(deal):
@@ -430,7 +459,7 @@ class XAUUSDAsianReversalStrategy:
             if profit < 0:
                 self.state.consecutive_losses += 1
                 if self.state.consecutive_losses >= self.config.max_consecutive_losses:
-                    until = (dt.datetime.now() + dt.timedelta(minutes=self.config.loss_cooldown_minutes)).isoformat()
+                    until = (deal_dt + dt.timedelta(minutes=self.config.loss_cooldown_minutes)).isoformat()
                     self.state.loss_cooldown_until = until
                     LOGGER.warning("Loss cooldown activated: %s", until)
             elif profit > 0:
@@ -451,28 +480,63 @@ class XAUUSDAsianReversalStrategy:
 
     pymt5linux_bridge_broken_reinit: bool = False
 
+    def _recreate_mt5_client(self, reason: str) -> None:
+        self._connect_fail_streak += 1
+        LOGGER.warning("Recreating MT5 client (streak=%s): %s", self._connect_fail_streak, reason)
+        now = time.time()
+        if now - self._last_reconnect_ts < 5:
+            time.sleep(2)
+        self._last_reconnect_ts = now
+        try:
+            self.mt5.shutdown()
+        except Exception:
+            pass
+        self.mt5 = MetaTrader5(host=self.config.host, port=self.config.port)
+        ok = self.mt5.initialize()
+        if not ok:
+            raise RuntimeError(f"MT5 reinitialize failed: {self.mt5.last_error()}")
+        if not self.mt5.symbol_select(self.config.symbol, True):
+            raise RuntimeError(f"symbol_select failed for {self.config.symbol}: {self.mt5.last_error()}")
+        self._connect_fail_streak = 0
+
     def _ensure_mt5(self) -> None:
         try:
             ok = self.mt5.initialize()
             if not ok:
                 LOGGER.debug("mt5.initialize() returned False: %s", self.mt5.last_error())
-            self.mt5.symbol_select(self.config.symbol, True)
+                self._recreate_mt5_client("initialize returned False")
+                return
+            if not self.mt5.symbol_select(self.config.symbol, True):
+                self._recreate_mt5_client(f"symbol_select failed: {self.mt5.last_error()}")
+                return
             self.pymt5linux_bridge_broken_reinit = True
         except Exception as exc:
-            LOGGER.debug("_ensure_mt5 exception: %s", exc)
+            self._recreate_mt5_client(f"_ensure_mt5 exception: {exc}")
 
     # ── Data Helpers ─────────────────────────────────────────────────
 
     def _get_bars(self, count: int) -> List:
-        self._ensure_mt5()
+        tf = self._timeframe_constant()
+        for attempt in range(3):
+            self._ensure_mt5()
+            rates = self.mt5.copy_rates_from_pos(self.config.symbol, tf, 0, count)
+            if rates is not None and len(rates) > 0:
+                return [Bar(r) for r in rates]
+            LOGGER.warning(
+                "copy_rates_from_pos unavailable (attempt %s/3): %s",
+                attempt + 1,
+                self.mt5.last_error(),
+            )
+            if attempt < 2:
+                self._recreate_mt5_client("copy_rates_from_pos unavailable")
+                time.sleep(1)
+        return []
+
+    def _timeframe_constant(self) -> int:
         tf_map = {"M1": self.mt5.TIMEFRAME_M1, "M5": self.mt5.TIMEFRAME_M5,
                   "M15": self.mt5.TIMEFRAME_M15, "M30": self.mt5.TIMEFRAME_M30,
                   "H1": self.mt5.TIMEFRAME_H1}
-        tf = tf_map.get(self.config.timeframe.upper(), self.mt5.TIMEFRAME_M1)
-        rates = self.mt5.copy_rates_from_pos(self.config.symbol, tf, 0, count)
-        if rates is None or len(rates) == 0:
-            return []
-        return [Bar(r) for r in rates]
+        return tf_map.get(self.config.timeframe.upper(), self.mt5.TIMEFRAME_M1)
 
     def _atr(self, bars: List) -> float:
         if len(bars) < self.config.atr_period + 1:
@@ -541,16 +605,12 @@ class XAUUSDAsianReversalStrategy:
 
     def _shutdown(self) -> None:
         try:
-            self.close_all_positions()
-        except Exception:
-            pass
-        try:
             self.mt5.shutdown()
         except Exception:
             pass
 
     def _ensure_day_context(self) -> None:
-        today = dt.datetime.now().date().isoformat()
+        today = self._chart_now().date().isoformat()
         if self.state.current_day != today:
             equity = self._equity()
             self.state.current_day = today
@@ -695,9 +755,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    log_handlers: List[logging.Handler] = [logging.StreamHandler()]
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=log_handlers,
+        force=True,
     )
     config = StrategyConfig(
         symbol=args.symbol, timeframe=args.timeframe, host=args.host, port=args.port,

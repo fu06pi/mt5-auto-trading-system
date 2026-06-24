@@ -218,6 +218,7 @@ class StrategyState:
     trailing_direction_by_ticket: Dict[str, str] = dataclasses.field(default_factory=dict)
     risk_warmup_started_at: Optional[str] = None
     last_processed_deal_time: Optional[str] = None
+    last_processed_deal_ticket: int = 0
     last_close_profit: float = 0.0
     signal_reversal_history: List[str] = dataclasses.field(default_factory=list)
     dd_cooldown_until: Optional[str] = None
@@ -250,6 +251,8 @@ class XAUUSDTrendStrategy:
         self._symbol_volume_step: float = 0.01
         self._symbol_contract_size: float = 1.0
         self._recent_primary_signals: Deque[str] = deque(maxlen=48)
+        self._deal_sync_failed: bool = False
+        self._prev_owned_positions: int = 0
         self._last_score = 0.0
         self._proactive_ipc_counter = 0
 
@@ -278,6 +281,7 @@ class XAUUSDTrendStrategy:
                     continue
 
                 self._last_bar_time = snapshot.bar_time
+                self._sync_closed_trades(snapshot.bar_time)
                 self._handle_bar(snapshot)
             except KeyboardInterrupt:
                 self._log("Interrupted by user, shutting down.")
@@ -337,6 +341,7 @@ class XAUUSDTrendStrategy:
                 },
                 risk_warmup_started_at=data.get("risk_warmup_started_at"),
                 last_processed_deal_time=data.get("last_processed_deal_time"),
+                last_processed_deal_ticket=int(data.get("last_processed_deal_ticket", 0) or 0),
                 last_close_profit=float(data.get("last_close_profit", 0.0)),
                 signal_reversal_history=[
                     str(item).upper()
@@ -379,6 +384,7 @@ class XAUUSDTrendStrategy:
             "trailing_direction_by_ticket": self.state.trailing_direction_by_ticket,
             "risk_warmup_started_at": self.state.risk_warmup_started_at,
             "last_processed_deal_time": self.state.last_processed_deal_time,
+            "last_processed_deal_ticket": self.state.last_processed_deal_ticket,
             "last_close_profit": self.state.last_close_profit,
             "signal_reversal_history": self.state.signal_reversal_history,
             "dd_cooldown_until": self.state.dd_cooldown_until,
@@ -401,6 +407,21 @@ class XAUUSDTrendStrategy:
                 f.write(f"{dt.datetime.now().isoformat(sep=' ', timespec='seconds')} {line}\n")
         except Exception:
             pass
+
+    def _chart_now(self) -> dt.datetime:
+        """MT5 tick time → chart/EET naive; fallback to UTC naive for tests."""
+        try:
+            tick = self.mt5.symbol_info_tick(self.config.symbol)
+            tick_time = int(getattr(tick, "time", 0) or 0) if tick is not None else 0
+            if tick_time > 0:
+                return self._mt5_timestamp_to_chart_time(tick_time)
+        except Exception:
+            pass
+        return dt.datetime.now(dt.UTC).replace(tzinfo=None)
+
+    def _history_query_now(self) -> dt.datetime:
+        """Local naive datetime for bridge history_deals_get query window."""
+        return dt.datetime.now()
 
     def _connect(self) -> None:
         if self.config.terminal_path:
@@ -696,7 +717,8 @@ class XAUUSDTrendStrategy:
         self.state.loss_cooldown_until = None
         self.state.loss_cooldown_triggered_at = None
         self.state.auto_half_close_done = False
-        self.state.last_processed_deal_time = dt.datetime.now().isoformat(timespec="seconds")
+        self.state.last_processed_deal_time = self._chart_now().isoformat(timespec="seconds")
+        self.state.last_processed_deal_ticket = 0
         self.state.paused = False
         self.state.paused_reason = ""
         self._save_state()
@@ -744,7 +766,7 @@ class XAUUSDTrendStrategy:
         except ValueError:
             self._log("Invalid DD cooldown timestamp: %s", self.state.dd_cooldown_until)
             return
-        now = dt.datetime.now()
+        now = self._chart_now()
         if now < until:
             self._log("DD cooldown active: until=%s reason=%s", self.state.dd_cooldown_until, self.state.paused_reason)
             return
@@ -763,6 +785,7 @@ class XAUUSDTrendStrategy:
         self.state.paused = False
         self.state.paused_reason = ""
         self.state.last_processed_deal_time = now.isoformat(timespec="seconds")
+        self.state.last_processed_deal_ticket = 0
         self._log("DD cooldown expired; resumed with fresh baseline equity=%.2f", equity)
         self._save_state()
 
@@ -798,7 +821,7 @@ class XAUUSDTrendStrategy:
         self._save_state()
 
         if daily_dd >= self.config.daily_dd_limit:
-            now = dt.datetime.now()
+            now = self._chart_now()
             until = now + dt.timedelta(hours=4)
             self.state.paused = True
             self.state.paused_reason = f"Daily drawdown {daily_dd * 100.0:.2f}% >= {self.config.daily_dd_limit * 100.0:.2f}%"
@@ -810,7 +833,7 @@ class XAUUSDTrendStrategy:
             raise SystemExit(1)
 
         if total_dd >= self.config.total_dd_limit:
-            now = dt.datetime.now()
+            now = self._chart_now()
             until = now + dt.timedelta(hours=4)
             self.state.paused = True
             self.state.paused_reason = f"Total drawdown {total_dd * 100.0:.2f}% >= {self.config.total_dd_limit * 100.0:.2f}%"
@@ -875,12 +898,21 @@ class XAUUSDTrendStrategy:
         if len(htf_bars) < max(self.config.htf_slow_sma, self.config.htf_fast_sma) + 3:
             raise RuntimeError(f"Not enough HTF bars: {len(htf_bars)}")
         closes = [bar["close"] for bar in htf_bars[:-1]]
+        last_close = closes[-1]
         fast = statistics.fmean(closes[-self.config.htf_fast_sma:])
         slow = statistics.fmean(closes[-self.config.htf_slow_sma:])
         if len(closes) >= 4:
             recent_slope = closes[-1] - closes[-4]
         else:
             recent_slope = 0.0
+        # Price-position override: when price is below both SMAs, the
+        # SMA-cross signal is lagging and misleading — force BEAR.
+        # Likewise when price is above both SMAs, force BULL.
+        if last_close < fast and last_close < slow:
+            return fast, slow, "BEAR"
+        if last_close > fast and last_close > slow:
+            return fast, slow, "BULL"
+        # Fallback to SMA cross with slope confirmation.
         if fast > slow and recent_slope >= 0:
             return fast, slow, "BULL"
         if fast < slow and recent_slope <= 0:
@@ -997,12 +1029,14 @@ class XAUUSDTrendStrategy:
             self.state.loss_cooldown_triggered_at = None
             self._save_state()
             return False
-        current = now or dt.datetime.now()
+        current = now or self._chart_now()
         if current < until:
             return True
         self._log("Loss cooldown expired: until=%s", self.state.loss_cooldown_until)
         self.state.loss_cooldown_until = None
         self.state.loss_cooldown_triggered_at = None
+        self.state.consecutive_losses = 0
+        self._log("Consecutive losses reset to 0 after cooldown expiry")
         self._save_state()
         return False
 
@@ -1016,7 +1050,7 @@ class XAUUSDTrendStrategy:
             self.state.profit_pause_triggered_at = None
             self._save_state()
             return False
-        current = now or dt.datetime.now()
+        current = now or self._chart_now()
         if current < until:
             return True
         self._log("Profit-close pause expired: until=%s", self.state.profit_pause_until)
@@ -1029,7 +1063,7 @@ class XAUUSDTrendStrategy:
         minutes = int(self.config.profit_close_pause_minutes)
         if minutes <= 0:
             return
-        now = dt.datetime.now()
+        now = self._chart_now()
         until = now + dt.timedelta(minutes=minutes)
         self.state.profit_pause_triggered_at = now.isoformat(timespec="seconds")
         self.state.profit_pause_until = until.isoformat(timespec="seconds")
@@ -1050,7 +1084,7 @@ class XAUUSDTrendStrategy:
             self.state.loss_pause_triggered_at = None
             self._save_state()
             return False
-        current = now or dt.datetime.now()
+        current = now or self._chart_now()
         if current < until:
             return True
         self._log("Loss-close pause expired: until=%s", self.state.loss_pause_until)
@@ -1059,23 +1093,24 @@ class XAUUSDTrendStrategy:
         self._save_state()
         return False
 
-    def _activate_loss_close_pause(self, close_profit: float) -> None:
+    def _activate_loss_close_pause(self, close_profit: float, closed_at: Optional[dt.datetime] = None) -> None:
         minutes = int(self.config.loss_close_pause_minutes)
         if minutes <= 0:
             return
         if self._loss_close_pause_active():
             return
-        now = dt.datetime.now()
-        until = now + dt.timedelta(minutes=minutes)
-        self.state.loss_pause_triggered_at = now.isoformat(timespec="seconds")
+        trigger_at = closed_at or self._chart_now()
+        until = trigger_at + dt.timedelta(minutes=minutes)
+        self.state.loss_pause_triggered_at = trigger_at.isoformat(timespec="seconds")
         self.state.loss_pause_until = until.isoformat(timespec="seconds")
         self._log(
-            "Loss-close pause active: close_profit=%.2f until=%s",
+            "Loss-close pause active: close_profit=%.2f closed_at=%s until=%s",
             close_profit,
+            self.state.loss_pause_triggered_at,
             self.state.loss_pause_until,
         )
 
-    def _activate_loss_cooldown(self) -> None:
+    def _activate_loss_cooldown(self, closed_at: Optional[dt.datetime] = None) -> None:
         threshold = int(self.config.loss_cooldown_losses)
         minutes = int(self.config.loss_cooldown_minutes)
         if threshold <= 0 or minutes <= 0:
@@ -1084,16 +1119,18 @@ class XAUUSDTrendStrategy:
             return
         if self._loss_cooldown_active():
             return
-        now = dt.datetime.now()
-        until = now + dt.timedelta(minutes=minutes)
-        self.state.loss_cooldown_triggered_at = now.isoformat(timespec="seconds")
+        trigger_at = closed_at or self._chart_now()
+        until = trigger_at + dt.timedelta(minutes=minutes)
+        self.state.loss_cooldown_triggered_at = trigger_at.isoformat(timespec="seconds")
         self.state.loss_cooldown_until = until.isoformat(timespec="seconds")
         self._log(
-            "Loss cooldown active: consecutive_losses=%d threshold=%d until=%s",
+            "Loss cooldown active: consecutive_losses=%d threshold=%d closed_at=%s until=%s",
             self.state.consecutive_losses,
             threshold,
+            self.state.loss_cooldown_triggered_at,
             self.state.loss_cooldown_until,
         )
+
 
     def _friday_force_close_cutoff_reached(self, bar_time: dt.datetime) -> bool:
         cutoff_hour = int(self.config.force_close_friday_hour_utc)
@@ -1115,8 +1152,18 @@ class XAUUSDTrendStrategy:
         if self._loss_close_pause_active():
             return f"loss-close pause until {self.state.loss_pause_until}"
         if self.state.consecutive_losses >= int(self.config.max_consecutive_losses):
-            return f"consecutive loss cap reached: {self.state.consecutive_losses}"
-        if self._loss_cooldown_active():
+            if self._loss_cooldown_active():
+                return (
+                    f"loss cooldown until {self.state.loss_cooldown_until} "
+                    f"after {self.state.consecutive_losses} consecutive losses"
+                )
+            self._log(
+                "Consecutive loss cap (%d) reached but cooldown expired; resetting",
+                self.state.consecutive_losses,
+            )
+            self.state.consecutive_losses = 0
+            self._save_state()
+        elif self._loss_cooldown_active():
             return (
                 f"loss cooldown until {self.state.loss_cooldown_until} "
                 f"after {self.state.consecutive_losses} consecutive losses"
@@ -1181,7 +1228,7 @@ class XAUUSDTrendStrategy:
             self.state.trail_cooldown_until_by_direction.pop(direction_key, None)
             self._save_state()
             return False
-        current = now or dt.datetime.now()
+        current = now or self._chart_now()
         if current < until:
             self._log(
                 "Trailing-stop cooldown blocks %s entry until %s",
@@ -1241,16 +1288,56 @@ class XAUUSDTrendStrategy:
             return
         self._activate_trailing_stop_cooldown(closed_direction, deal_iso)
 
-    def _sync_closed_trades(self) -> None:
-        from_time = dt.datetime.now() - dt.timedelta(days=30)
-        to_time = dt.datetime.now()
-        try:
-            deals = self.mt5.history_deals_get(from_time, to_time)
-        except Exception:
+    def _sync_closed_trades(self, bar_time: Optional[dt.datetime] = None) -> None:
+        reference_bar_time = bar_time or self._last_bar_time or self._chart_now()
+        to_time = self._history_query_now()
+        # The Wine/pymt5linux bridge can miss late same-day deals when the query
+        # end is before the broker/chart day boundary. Query through the next
+        # chart-day buffer, then filter by the persistent deal cursor below.
+        history_end_time = max(
+            to_time,
+            reference_bar_time.replace(hour=0, minute=0, second=0, microsecond=0)
+            + dt.timedelta(days=1, hours=3),
+        )
+        # Use the chart/server day as lower bound and rely on the persistent
+        # deal cursor below to skip old deals. The Wine/pymt5linux bridge can
+        # omit newer same-day deals when the lower bound is near the cursor.
+        from_time = reference_bar_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        deals = None
+        for attempt in range(3):
+            try:
+                deals = self.mt5.history_deals_get(from_time, history_end_time)
+                if deals is None:
+                    # history_deals_get returns None on degraded IPC, not an
+                    # exception. Reinitialize the bridge connection and retry.
+                    self._log(
+                        "history_deals_get returned None (attempt %d/3); reinitializing bridge",
+                        attempt + 1,
+                    )
+                    if attempt < 2:
+                        self.mt5.shutdown()
+                        time.sleep(1)
+                        self._connect()
+                        time.sleep(1)
+                    continue
+                break
+            except Exception as exc:
+                self._log(
+                    "Closed deal sync query failed (attempt %d/3): %s",
+                    attempt + 1,
+                    exc,
+                )
+                if attempt < 2:
+                    time.sleep(2)
+        if deals is None:
+            self._log("Closed deal sync skipped: history_deals_get failed after 3 attempts")
+            self._deal_sync_failed = True
             return
+        self._deal_sync_failed = False
         if not deals:
             return
         latest_seen = self.state.last_processed_deal_time
+        latest_seen_ticket = int(self.state.last_processed_deal_ticket or 0)
         ordered_deals = sorted(
             list(deals),
             key=lambda item: (int(getattr(item, "time", 0) or 0), int(getattr(item, "ticket", 0) or 0)),
@@ -1259,15 +1346,23 @@ class XAUUSDTrendStrategy:
             deal_time = getattr(deal, "time", None)
             if deal_time is None:
                 continue
-            deal_iso = self._mt5_timestamp_to_chart_time(int(deal_time)).isoformat()
-            if latest_seen is not None and deal_iso <= latest_seen:
-                continue
+            deal_ticket = int(getattr(deal, "ticket", 0) or 0)
+            deal_dt = self._mt5_timestamp_to_chart_time(int(deal_time))
+            deal_iso = deal_dt.isoformat()
+            if latest_seen is not None:
+                if deal_iso < latest_seen:
+                    continue
+                if deal_iso == latest_seen and deal_ticket <= latest_seen_ticket:
+                    continue
             if not self._is_owned_closing_deal(deal):
                 continue
+            closed_at = deal_dt
             profit = self._deal_net_profit(deal)
             self.state.last_close_profit = profit
             self.state.last_processed_deal_time = deal_iso
+            self.state.last_processed_deal_ticket = deal_ticket
             latest_seen = deal_iso
+            latest_seen_ticket = deal_ticket
             self._sync_trailing_stop_cooldowns(deal, deal_iso)
             if abs(profit) < REALIZED_PNL_NOISE_USD:
                 self._log(
@@ -1279,14 +1374,16 @@ class XAUUSDTrendStrategy:
                     self.state.consecutive_losses,
                 )
                 continue
-            if profit < 0:
+            if profit < -5.0:
                 self.state.consecutive_losses += 1
-                self._activate_loss_cooldown()
-                self._activate_loss_close_pause(profit)
+                self._activate_loss_close_pause(profit, closed_at)
+                self._activate_loss_cooldown(closed_at)
             elif profit > 0:
                 self.state.consecutive_losses = 0
                 self.state.loss_cooldown_until = None
                 self.state.loss_cooldown_triggered_at = None
+                self.state.loss_pause_until = None
+                self.state.loss_pause_triggered_at = None
             self._log(
                 "Closed deal sync | time=%s symbol=%s magic=%s profit=%.2f consecutive_losses=%d",
                 deal_iso,
@@ -1939,9 +2036,10 @@ class XAUUSDTrendStrategy:
         return "NONE", "none"
 
     def _handle_bar(self, snapshot: MarketSnapshot) -> None:
-        self._sync_closed_trades()
         positions = self._positions()
         foreign_positions = self._foreign_positions()
+        if len(positions) > 0:
+            self._prev_owned_positions = len(positions)
         self._log(
             "Bar %s | close=%.2f atr=%.2f fast=%.2f slow=%.2f htf=%s htf_comp=%s spread=%.1f momentum=%.2f m15_mom=%.2f score=%.2f signal=%s source=%s session=%s chop=%s chop_points=%d chop_reason=%s chop_mult=%.2f fb=%s fb_reason=%s vol_r=%.2f accel=%.2f positions=%d foreign=%d trades_today=%d losses=%d",
             snapshot.bar_time,
@@ -1998,11 +2096,11 @@ class XAUUSDTrendStrategy:
             self._log("Trading paused: %s", self.state.paused_reason)
             return
 
-        if self._profit_pause_active():
+        if self._profit_pause_active(snapshot.bar_time):
             self._log("Profit-close pause blocks new entries until %s", self.state.profit_pause_until)
             return
 
-        if self._loss_close_pause_active():
+        if self._loss_close_pause_active(snapshot.bar_time):
             self._log("Loss-close pause blocks new entries until %s", self.state.loss_pause_until)
             return
 
@@ -2022,20 +2120,33 @@ class XAUUSDTrendStrategy:
             return
 
         if self.state.consecutive_losses >= self.config.max_consecutive_losses:
-            self._log("Consecutive loss cap reached: %d", self.state.consecutive_losses)
-            self._maybe_trail(snapshot, positions[0]) if positions else None
-            return
-
-        if self._loss_cooldown_active():
+            if self._loss_cooldown_active():
+                self._log(
+                    "Loss cooldown blocks new entries: losses=%d until=%s",
+                    self.state.consecutive_losses,
+                    self.state.loss_cooldown_until,
+                )
+                self._maybe_trail(snapshot, positions[0]) if positions else None
+                return
             self._log(
-                "Loss cooldown blocks new entries: losses=%d until=%s",
+                "Consecutive loss cap (%d) reached but cooldown expired; resetting",
                 self.state.consecutive_losses,
-                self.state.loss_cooldown_until,
             )
-            self._maybe_trail(snapshot, positions[0]) if positions else None
-            return
+            self.state.consecutive_losses = 0
+            self._save_state()
 
         if not positions:
+            if self._prev_owned_positions > 0 and self._deal_sync_failed:
+                self._log(
+                    "Deal sync pending after position close (prev=%d); blocking new entry until sync succeeds",
+                    self._prev_owned_positions,
+                )
+                # ponytail: reset prev count so next bar isn't permanently locked.
+                # Deal sync retries in the background; once bridge recovers,
+                # _deal_sync_failed clears and entries resume normally.
+                self._prev_owned_positions = 0
+                return
+            self._prev_owned_positions = 0
             if foreign_positions and not self.config.allow_foreign_positions:
                 self._log("Foreign position present (%d); skip new entry.", len(foreign_positions))
                 return
@@ -2355,7 +2466,7 @@ class XAUUSDTrendStrategy:
             if changed:
                 self._save_state()
             return False
-        now = dt.datetime.now()
+        now = self._chart_now()
         raw_since = self.state.trail_profit_since_by_ticket.get(ticket_key)
         if raw_since is None:
             self.state.trail_profit_since_by_ticket[ticket_key] = now.isoformat(timespec="seconds")

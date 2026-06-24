@@ -370,7 +370,7 @@ class MACDTripleDivergenceStrategy:
             self._log(self.state.paused_reason)
             self.close_all_positions()
             self._save_state()
-            raise SystemExit(1)
+            return
 
         if total_dd >= self.config.total_dd_limit:
             self.state.paused = True
@@ -380,7 +380,7 @@ class MACDTripleDivergenceStrategy:
             self._log(self.state.paused_reason)
             self.close_all_positions()
             self._save_state()
-            raise SystemExit(1)
+            return
 
         if profit_progress >= self.config.profit_target:
             self.state.paused = True
@@ -388,7 +388,7 @@ class MACDTripleDivergenceStrategy:
             self._log(self.state.paused_reason)
             self.close_all_positions()
             self._save_state()
-            raise SystemExit(0)
+            return
 
     def _build_snapshot(self) -> MarketSnapshot:
         warmup = max(self.config.macd_slow, self.config.atr_period) * 3 + self.config.swing_window * 3
@@ -738,7 +738,7 @@ class MACDTripleDivergenceStrategy:
         return out
 
     def _foreign_positions(self) -> List[PositionState]:
-        return []
+        return [pos for pos in self._all_positions() if int(getattr(pos, "magic", 0)) != int(self.config.magic)]
 
     def _positions(self) -> List[PositionState]:
         return [pos for pos in self._all_positions() if int(getattr(pos, "magic", 0)) == int(self.config.magic)]
@@ -1046,8 +1046,25 @@ class MACDTripleDivergenceStrategy:
             last_dt = dt.datetime.fromisoformat(str(self.state.last_trade_bar_time))
         except Exception:
             return True
-        delta_bars = (bar_time - last_dt).total_seconds() / max(self.config.loop_seconds, 1)
+        bar_seconds = self._timeframe_seconds()
+        delta_bars = (bar_time - last_dt).total_seconds() / max(bar_seconds, 1)
         return delta_bars >= float(self.config.cooldown_bars_after_trade)
+
+    def _timeframe_seconds(self) -> float:
+        key = str(self.config.timeframe).strip().upper()
+        if key.startswith("M"):
+            try:
+                return float(max(1, int(key[1:])) * 60)
+            except ValueError:
+                return 300.0
+        if key.startswith("H"):
+            try:
+                return float(max(1, int(key[1:])) * 3600)
+            except ValueError:
+                return 3600.0
+        if key.startswith("D"):
+            return 86400.0
+        return float(max(self.config.loop_seconds, 1))
 
     def _resolve_timeframe(self, tf: str) -> int:
         key = tf.strip().upper()

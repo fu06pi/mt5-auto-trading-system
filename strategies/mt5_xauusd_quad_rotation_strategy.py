@@ -681,9 +681,6 @@ class QuadRotationStrategy:
         if k1[idx] <= overbought:
             return False
 
-        if k4[idx] > 100 - macro:
-            pass
-
         pullback_max = atr * self.config.pullback_max_deviation_atr
         ema_diff = ema_fast - price
         if ema_diff > pullback_max or ema_diff < -pullback_max * 2:
@@ -790,7 +787,8 @@ class QuadRotationStrategy:
                 if deal_magic != self.config.magic:
                     continue
                 deal_entry = getattr(deal, "entry", 0)
-                if deal_entry != 1:
+                close_entries = {getattr(self.mt5, "DEAL_ENTRY_OUT", 1), getattr(self.mt5, "DEAL_ENTRY_OUT_BY", 3)}
+                if deal_entry not in close_entries:
                     continue
                 deal_time = str(getattr(deal, "time", 0))
                 if deal_time == self.state.last_trade_time:

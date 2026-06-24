@@ -43,6 +43,7 @@ class FakeMT5:
         self._equity = 100000.0
         self._positions = list(self.default_positions)
         self._deals = []
+        self.history_queries = []
 
     def initialize(self, *args, **kwargs):
         return True
@@ -74,6 +75,7 @@ class FakeMT5:
         return self._positions
 
     def history_deals_get(self, from_time, to_time):
+        self.history_queries.append((from_time, to_time))
         return self._deals
 
     def last_error(self):
@@ -449,8 +451,9 @@ def test_loss_close_pause_blocks_only_until_expiry(tmp_path):
     strategy._activate_loss_close_pause(-125.0)
 
     assert strategy.state.loss_pause_until is not None
-    assert strategy._loss_close_pause_active(dt.datetime.now() + dt.timedelta(minutes=30))
-    assert not strategy._loss_close_pause_active(dt.datetime.now() + dt.timedelta(minutes=61))
+    chart_now = strategy._chart_now()
+    assert strategy._loss_close_pause_active(chart_now + dt.timedelta(minutes=30))
+    assert not strategy._loss_close_pause_active(chart_now + dt.timedelta(minutes=61))
     assert strategy.state.loss_pause_until is None
 
 
@@ -502,6 +505,7 @@ def test_closed_trade_sync_counts_only_owned_real_closing_deals(tmp_path):
         magic=909001,
         loss_cooldown_losses=3,
         loss_cooldown_minutes=120,
+        loss_close_pause_minutes=15,
     )
     strategy = module.XAUUSDTrendStrategy(config)
     base = int(dt.datetime(2026, 6, 12, 22, 0, tzinfo=dt.UTC).timestamp())
@@ -515,11 +519,138 @@ def test_closed_trade_sync_counts_only_owned_real_closing_deals(tmp_path):
         types.SimpleNamespace(ticket=7, time=base + 70, symbol="US100.cash", magic=909001, entry=FakeMT5.DEAL_ENTRY_OUT, profit=-200.0, commission=0.0, swap=0.0),
     ]
 
-    strategy._sync_closed_trades()
+    strategy._sync_closed_trades(bar_time=dt.datetime(2026, 6, 12, 22, 0, 0))
 
     assert strategy.state.consecutive_losses == 3
     assert strategy.state.loss_cooldown_until is not None
+    assert strategy.state.loss_pause_until is not None
     assert strategy.state.last_close_profit == -200.0
+
+def test_closed_trade_sync_ignores_small_losses_for_consecutive_and_pause(tmp_path):
+    module = load_strategy_module()
+    config = make_config(
+        module,
+        tmp_path,
+        symbol="US100.cash",
+        magic=909001,
+        loss_cooldown_losses=3,
+        loss_cooldown_minutes=120,
+        loss_close_pause_minutes=15,
+    )
+    strategy = module.XAUUSDTrendStrategy(config)
+    base = int(dt.datetime(2026, 6, 12, 22, 0, tzinfo=dt.UTC).timestamp())
+    strategy.mt5._deals = [
+        types.SimpleNamespace(ticket=11, time=base + 10, symbol="US100.cash", magic=909001, entry=FakeMT5.DEAL_ENTRY_OUT, profit=-4.99, commission=0.0, swap=0.0),
+        types.SimpleNamespace(ticket=12, time=base + 20, symbol="US100.cash", magic=909001, entry=FakeMT5.DEAL_ENTRY_OUT, profit=-5.01, commission=0.0, swap=0.0),
+    ]
+
+    strategy._sync_closed_trades(bar_time=dt.datetime(2026, 6, 12, 22, 0, 0))
+
+    assert strategy.state.consecutive_losses == 1
+    assert strategy.state.loss_cooldown_until is None
+    assert strategy.state.loss_pause_until is not None
+
+
+def test_closed_trade_sync_processes_same_second_newer_tickets(tmp_path):
+    module = load_strategy_module()
+    config = make_config(module, tmp_path, magic=909001, loss_cooldown_losses=2, loss_cooldown_minutes=120)
+    strategy = module.XAUUSDTrendStrategy(config)
+    close_time = int(dt.datetime(2026, 6, 12, 22, 0, tzinfo=dt.UTC).timestamp())
+    strategy.state.last_processed_deal_time = dt.datetime.fromtimestamp(close_time, dt.UTC).replace(tzinfo=None).isoformat()
+    strategy.state.last_processed_deal_ticket = 100
+    strategy.mt5._deals = [
+        types.SimpleNamespace(ticket=100, time=close_time, symbol="XAUUSD", magic=909001, entry=FakeMT5.DEAL_ENTRY_OUT, profit=-100.0, commission=0.0, swap=0.0),
+        types.SimpleNamespace(ticket=101, time=close_time, symbol="XAUUSD", magic=909001, entry=FakeMT5.DEAL_ENTRY_OUT, profit=-150.0, commission=0.0, swap=0.0),
+        types.SimpleNamespace(ticket=102, time=close_time, symbol="XAUUSD", magic=909001, entry=FakeMT5.DEAL_ENTRY_OUT, profit=-200.0, commission=0.0, swap=0.0),
+    ]
+
+    strategy._sync_closed_trades(bar_time=dt.datetime(2026, 6, 12, 22, 0, 0))
+
+    assert strategy.state.consecutive_losses == 2
+    assert strategy.state.last_processed_deal_ticket == 102
+    assert strategy.state.last_close_profit == -200.0
+
+
+def test_loss_close_pause_uses_actual_deal_close_time(tmp_path):
+    module = load_strategy_module()
+    config = make_config(
+        module,
+        tmp_path,
+        magic=909001,
+        loss_cooldown_losses=1,
+        loss_cooldown_minutes=15,
+        loss_close_pause_minutes=60,
+    )
+    strategy = module.XAUUSDTrendStrategy(config)
+    close_at = dt.datetime.now(dt.UTC).replace(tzinfo=None, microsecond=0) - dt.timedelta(minutes=5)
+    close_ts = int(close_at.replace(tzinfo=dt.UTC).timestamp())
+    strategy.mt5._deals = [
+        types.SimpleNamespace(ticket=200, time=close_ts, symbol="XAUUSD", magic=909001, entry=FakeMT5.DEAL_ENTRY_OUT, profit=-100.0, commission=0.0, swap=0.0),
+    ]
+
+    strategy._sync_closed_trades(bar_time=close_at)
+
+    assert strategy.state.loss_pause_triggered_at == close_at.isoformat()
+    assert strategy.state.loss_pause_until == (close_at + dt.timedelta(minutes=60)).isoformat()
+    assert strategy._loss_close_pause_active()
+
+
+def test_closed_trade_sync_uses_local_history_query_time_not_chart_now(tmp_path):
+    module = load_strategy_module()
+    config = make_config(
+        module,
+        tmp_path,
+        magic=909001,
+        loss_cooldown_losses=1,
+        loss_cooldown_minutes=15,
+        loss_close_pause_minutes=60,
+    )
+    strategy = module.XAUUSDTrendStrategy(config)
+    chart_now = dt.datetime(2026, 6, 19, 5, 0, 0)
+    local_query_now = dt.datetime(2026, 6, 19, 13, 0, 0)
+    close_at = chart_now - dt.timedelta(minutes=5)
+    close_ts = int(close_at.replace(tzinfo=dt.UTC).timestamp())
+    strategy._chart_now = lambda: chart_now
+    strategy._history_query_now = lambda: local_query_now
+    strategy.mt5._deals = [
+        types.SimpleNamespace(ticket=201, time=close_ts, symbol="XAUUSD", magic=909001, entry=FakeMT5.DEAL_ENTRY_OUT, profit=-100.0, commission=0.0, swap=0.0),
+    ]
+
+    strategy._sync_closed_trades(bar_time=close_at)
+
+    expected_history_end = dt.datetime(2026, 6, 20, 3, 0, 0)
+    expected_history_start = close_at.replace(hour=0, minute=0, second=0, microsecond=0)
+    assert strategy.mt5.history_queries == [(expected_history_start, expected_history_end)]
+    assert strategy.state.loss_pause_triggered_at == close_at.isoformat()
+    assert strategy.state.loss_pause_until == (close_at + dt.timedelta(minutes=60)).isoformat()
+
+
+def test_closed_trade_sync_processes_losses_after_current_bar(tmp_path):
+    module = load_strategy_module()
+    config = make_config(
+        module,
+        tmp_path,
+        magic=909001,
+        loss_cooldown_losses=1,
+        loss_cooldown_minutes=15,
+        loss_close_pause_minutes=15,
+    )
+    strategy = module.XAUUSDTrendStrategy(config)
+    bar_time = dt.datetime(2026, 6, 22, 18, 55, 0)
+    close_at = dt.datetime(2026, 6, 22, 18, 56, 13)
+    close_ts = int(close_at.replace(tzinfo=dt.UTC).timestamp())
+    strategy._history_query_now = lambda: dt.datetime(2026, 6, 22, 23, 58, 0)
+    strategy.mt5._deals = [
+        types.SimpleNamespace(ticket=301, time=close_ts, symbol="XAUUSD", magic=909001, entry=FakeMT5.DEAL_ENTRY_OUT, profit=-205.44, commission=-0.94, swap=0.0),
+    ]
+
+    strategy._sync_closed_trades(bar_time=bar_time)
+
+    assert strategy.state.last_processed_deal_ticket == 301
+    assert strategy.state.last_close_profit == -206.38
+    assert strategy.state.loss_pause_triggered_at == close_at.isoformat()
+    assert strategy.state.loss_pause_until == (close_at + dt.timedelta(minutes=15)).isoformat()
+
 
 
 def test_enter_hard_blocks_before_order_send_when_loss_cooldown_active(tmp_path):

@@ -25,6 +25,10 @@ terminal.ini
 *.srv
 
 # MT5 / strategy runtime local state
+backups/
+*.bak*
+*.backup*
+*.with_*_backup
 auto_quant/state/
 auto_quant/archive/
 auto_quant/backups/
@@ -42,6 +46,14 @@ research/
 *_supervisor.out
 
 # Logs / reports / generated outputs
+/research_*.py
+/backtest_*.py
+/tmp_*.py
+/collect_*.py
+/collect_*.sh
+/merge_*.py
+/build_*.py
+/forward_*.py
 logs/
 log/
 *.log

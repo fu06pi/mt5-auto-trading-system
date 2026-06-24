@@ -81,6 +81,8 @@ class StrategyState:
     initial_equity: Optional[float] = None
     max_equity_seen: Optional[float] = None
     trades_today: int = 0
+    consecutive_losses: int = 0
+    last_processed_deal_time: Optional[str] = None
     paused: bool = False
     paused_reason: str = ""
     last_signal_time: Optional[str] = None
@@ -350,6 +352,7 @@ class IFVGSniperStrategy:
             return
         latest_bar = closed_bars[-1]
         self._roll_day(latest_bar["time"])
+        self._sync_closed_trades()
         self._risk_guard()
 
         engine = IFVGEngine(self.config, self._point)
@@ -590,6 +593,8 @@ class IFVGSniperStrategy:
         elif total_dd >= self.config.total_dd_limit:
             self.state.paused = True
             self.state.paused_reason = f"total_dd_hit:{total_dd:.2%}"
+            self._log("_risk_guard: closing positions due to total DD %.2f%%", total_dd * 100)
+            self.close_all_positions()
         self._save_state()
 
     def _equity(self) -> float:
@@ -710,6 +715,59 @@ class IFVGSniperStrategy:
             except RuntimeError:
                 pass
             self._initialized = False
+
+    def close_all_positions(self) -> None:
+        try:
+            positions = self.mt5.positions_get(symbol=self.symbol)
+            if positions is None:
+                self._log("close_all_positions: positions_get failed: %s", self.mt5.last_error())
+                return
+            for pos in positions:
+                if pos.symbol != self.symbol:
+                    continue
+                request = {
+                    "action": self.mt5.TRADE_ACTION_DEAL,
+                    "symbol": self.symbol,
+                    "position": pos.ticket,
+                    "volume": pos.volume,
+                    "type": self.mt5.ORDER_TYPE_BUY if pos.type == 1 else self.mt5.ORDER_TYPE_SELL,
+                    "price": self.mt5.symbol_info_tick(self.symbol).bid if pos.type == 1 else self.mt5.symbol_info_tick(self.symbol).ask,
+                    "deviation": self.config.deviation,
+                    "magic": self.config.magic,
+                    "comment": "close_all",
+                    "type_time": self.mt5.ORDER_TIME_GTC,
+                    "type_filling": self.mt5.ORDER_FILLING_IOC,
+                }
+                self._log("close_all_positions: closing ticket=%s volume=%s", pos.ticket, pos.volume)
+                result = self.mt5.order_send(request)
+                if result is not None and result.retcode != self.mt5.TRADE_RETCODE_DONE:
+                    self._log("close_all_positions: ticket=%s retcode=%s", pos.ticket, result.retcode)
+        except RuntimeError as exc:
+            self._log("close_all_positions error: %s", exc)
+
+    def _sync_closed_trades(self) -> None:
+        from_dt = None
+        if self.state.last_processed_deal_time is not None:
+            from_dt = dt.datetime.fromisoformat(self.state.last_processed_deal_time)
+        now = dt.datetime.now(self._tz)
+        deals = self.mt5.history_deals_get(from_dt, now) if from_dt else None
+        if deals is None:
+            deals = self.mt5.history_deals_get(now - dt.timedelta(days=7), now)
+        if deals is None or len(deals) == 0:
+            return
+        sorted_deals = sorted(deals, key=lambda d: d.time)
+        new_deals = [d for d in sorted_deals if d.symbol == self.symbol and d.magic == self.config.magic and d.entry == 0]
+        for deal in new_deals:
+            if self.state.last_processed_deal_time and deal.time <= dt.datetime.fromisoformat(self.state.last_processed_deal_time).timestamp():
+                continue
+            if deal.profit >= 0:
+                self.state.consecutive_losses = 0
+            else:
+                self.state.consecutive_losses += 1
+                self._log("_sync_closed_trades: consecutive_losses=%d profit=%.2f ticket=%s", self.state.consecutive_losses, deal.profit, deal.ticket)
+        if new_deals:
+            latest = max(d.time for d in new_deals)
+            self.state.last_processed_deal_time = dt.datetime.fromtimestamp(latest, tz=self._tz).isoformat()
 
     def _resolve_timeframe(self, name: str) -> int:
         key = name.upper()

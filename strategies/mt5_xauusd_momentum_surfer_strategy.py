@@ -36,6 +36,7 @@ from shared.account_metrics import AccountMetricsStore
 LOGGER = logging.getLogger("xauusd_momentum_surfer")
 STATE_PATH_DEFAULT = "/home/chain4655/Documents/Sample/Python/xauusd_momentum_surfer_state.json"
 LOG_PATH_DEFAULT = "/home/chain4655/Documents/Sample/Python/xauusd_momentum_surfer.log"
+REALIZED_PNL_NOISE_USD = 4.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,6 +52,7 @@ class StrategyConfig:
     profit_target: float
     risk_pct: float
     max_lots: float
+    max_lots_per_order: float
     max_leverage: float
     atr_period: int
     vol_lookback: int
@@ -70,6 +72,9 @@ class StrategyConfig:
     max_consecutive_losses: int
     loss_cooldown_losses: int
     loss_cooldown_minutes: int
+    loss_close_pause_minutes: int
+    profit_close_usd: float
+    profit_close_pause_minutes: int
     cooldown_seconds: int
     max_hold_minutes: int
     loop_seconds: int
@@ -80,6 +85,7 @@ class StrategyConfig:
     terminal_path: Optional[str]
     deviation: int
     magic: int
+    order_comment: str
     log_level: str
 
 
@@ -130,7 +136,10 @@ class StrategyState:
     loss_cooldown_triggered_at: Optional[str] = None
     last_trade_time: Optional[str] = None
     last_processed_deal_time: Optional[str] = None
+    last_processed_deal_ticket: int = 0
     last_close_profit: float = 0.0
+    loss_pause_until: Optional[str] = None
+    profit_pause_until: Optional[str] = None
     paused_reason: str = ""
     paused: bool = False
 
@@ -150,6 +159,9 @@ class XAUUSDMomentumSurferStrategy:
         self._rates_fail_streak = 0
         self._connect_fail_streak = 0
         self._last_reconnect_ts = 0.0
+        self._cached_symbol_info = None
+        self._cached_point: Optional[float] = None
+        self._cached_digits: Optional[int] = None
         self._initialized = False
 
     def run(self) -> None:
@@ -171,7 +183,9 @@ class XAUUSDMomentumSurferStrategy:
                     self._initialized = True
 
                 self._ensure_day_context(snapshot.bar_time)
+                self._sync_closed_trades()
                 self._risk_guard(snapshot)
+                self._maybe_profit_close_on_loop()
 
                 if self._last_bar_time is not None and snapshot.bar_time <= self._last_bar_time:
                     time.sleep(self.config.loop_seconds)
@@ -210,7 +224,10 @@ class XAUUSDMomentumSurferStrategy:
                 loss_cooldown_triggered_at=data.get("loss_cooldown_triggered_at"),
                 last_trade_time=data.get("last_trade_time"),
                 last_processed_deal_time=data.get("last_processed_deal_time"),
+                last_processed_deal_ticket=int(data.get("last_processed_deal_ticket", 0) or 0),
                 last_close_profit=float(data.get("last_close_profit", 0.0)),
+                loss_pause_until=data.get("loss_pause_until"),
+                profit_pause_until=data.get("profit_pause_until"),
                 paused_reason=str(data.get("paused_reason", "")),
                 paused=bool(data.get("paused", False)),
             )
@@ -231,7 +248,10 @@ class XAUUSDMomentumSurferStrategy:
             "loss_cooldown_triggered_at": self.state.loss_cooldown_triggered_at,
             "last_trade_time": self.state.last_trade_time,
             "last_processed_deal_time": self.state.last_processed_deal_time,
+            "last_processed_deal_ticket": self.state.last_processed_deal_ticket,
             "last_close_profit": self.state.last_close_profit,
+            "loss_pause_until": self.state.loss_pause_until,
+            "profit_pause_until": self.state.profit_pause_until,
             "paused_reason": self.state.paused_reason,
             "paused": self.state.paused,
         }
@@ -250,6 +270,29 @@ class XAUUSDMomentumSurferStrategy:
                 f.write(f"{dt.datetime.now().isoformat(sep=' ', timespec='seconds')} {line}\n")
         except Exception:
             pass
+
+    def _chart_now(self) -> dt.datetime:
+        """Return naive MT5 chart/server time for strategy-state comparisons.
+
+        FTMO/pymt5linux bar/deal/tick epochs are on the broker chart-time basis
+        (currently real UTC+3), not the Asia/Taipei host clock. Cooldowns,
+        sessions, and state timestamps must all use the same chart/server basis.
+        `history_deals_get()` query windows intentionally stay host-local in
+        `_history_query_now()` because the bridge expects local naive datetimes.
+        """
+        try:
+            tick, _error = self._tick_once()
+            tick_time = int(getattr(tick, "time", 0) or 0) if tick is not None else 0
+            if tick_time > 0:
+                return self._mt5_timestamp_to_chart_time(tick_time)
+        except Exception:
+            pass
+        # Fallback only for pre-connect/test paths; live paths should use MT5 tick time.
+        return dt.datetime.now(dt.UTC).replace(tzinfo=None)
+
+    def _history_query_now(self) -> dt.datetime:
+        """Naive local timestamp expected by Wine/pymt5linux history_deals_get."""
+        return dt.datetime.now()
 
     def _connect(self) -> None:
         if self.config.terminal_path:
@@ -270,12 +313,39 @@ class XAUUSDMomentumSurferStrategy:
         except Exception:
             return False
 
+    def _symbol_info(self) -> Any:
+        info, _error = self._symbol_info_once()
+        if info is not None:
+            self._cached_symbol_info = info
+            point = float(getattr(info, "point", 0.0) or 0.0)
+            digits = int(getattr(info, "digits", 0) or 0)
+            if point > 0:
+                self._cached_point = point
+            if digits >= 0:
+                self._cached_digits = digits
+            return info
+        if self._cached_symbol_info is not None:
+            return self._cached_symbol_info
+        raise RuntimeError("symbol_info unavailable")
+
     def _prepare_symbol(self) -> None:
-        if not self.mt5.symbol_select(self.symbol, True):
-            raise RuntimeError(f"symbol_select failed for {self.symbol}: {self.mt5.last_error()}")
-        info = self.mt5.symbol_info(self.symbol)
-        if info is None:
-            raise RuntimeError(f"symbol_info is None for {self.symbol}")
+        for attempt in range(5):
+            selected = self.mt5.symbol_select(self.symbol, True)
+            info = self.mt5.symbol_info(self.symbol) if selected else None
+            if info is not None:
+                self._cached_symbol_info = info
+                self._cached_point = float(getattr(info, "point", 0.0) or 0.0)
+                self._cached_digits = int(getattr(info, "digits", 0) or 0)
+                break
+            self._log(
+                "symbol_select/info unavailable (attempt %s/5): selected=%s error=%s",
+                attempt + 1,
+                selected,
+                self.mt5.last_error(),
+            )
+            time.sleep(1)
+        else:
+            raise RuntimeError(f"symbol_info unavailable after retries: {self.mt5.last_error()}")
         self._log(
             "Symbol ready: %s | digits=%s point=%s volume_min=%s volume_step=%s",
             self.symbol,
@@ -291,6 +361,145 @@ class XAUUSDMomentumSurferStrategy:
         except Exception:
             pass
 
+    # ---- Fresh-client pattern (ported from mt5_xauusd_trend_strategy.py) ----
+    # On this Wine/MT5 bridge, long-lived pymt5linux clients degrade into
+    # (-10004, 'No IPC connection') after repeated market-data / trading calls.
+    # Each heavy operation gets its own short-lived client so the stale-client
+    # path never triggers, while self.mt5 stays for misc / constant lookups.
+
+    def _account_info_once(self) -> Tuple[Optional[Any], Any]:
+        client = MetaTrader5(host=self.config.host, port=self.config.port)
+        try:
+            ok = client.initialize()
+            if not ok:
+                return None, client.last_error()
+            info = client.account_info()
+            return info, client.last_error()
+        except Exception as exc:
+            return None, exc
+        finally:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+
+    def _copy_rates_once(self, timeframe: int, bars: int) -> Tuple[Optional[Any], Any]:
+        """Fetch rates through a short-lived pymt5linux client."""
+        client = MetaTrader5(host=self.config.host, port=self.config.port)
+        try:
+            ok = client.initialize()
+            if not ok:
+                return None, client.last_error()
+            try:
+                client.symbol_select(self.symbol, True)
+            except Exception:
+                pass
+            rates = client.copy_rates_from_pos(self.symbol, timeframe, 0, bars)
+            return rates, client.last_error()
+        except Exception as exc:
+            return None, exc
+        finally:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+
+    def _tick_once(self) -> Tuple[Optional[Any], Any]:
+        client = MetaTrader5(host=self.config.host, port=self.config.port)
+        try:
+            ok = client.initialize()
+            if not ok:
+                return None, client.last_error()
+            try:
+                client.symbol_select(self.symbol, True)
+            except Exception:
+                pass
+            tick = client.symbol_info_tick(self.symbol)
+            return tick, client.last_error()
+        except Exception as exc:
+            return None, exc
+        finally:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+
+    def _positions_once(self) -> Tuple[Optional[Any], Any]:
+        client = MetaTrader5(host=self.config.host, port=self.config.port)
+        try:
+            ok = client.initialize()
+            if not ok:
+                return None, client.last_error()
+            try:
+                client.symbol_select(self.symbol, True)
+            except Exception:
+                pass
+            positions = client.positions_get(symbol=self.symbol)
+            return positions, client.last_error()
+        except Exception as exc:
+            return None, exc
+        finally:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+
+    def _order_send_once(self, request: Dict[str, Any]) -> Tuple[Optional[Any], Any]:
+        client = MetaTrader5(host=self.config.host, port=self.config.port)
+        try:
+            ok = client.initialize()
+            if not ok:
+                return None, client.last_error()
+            try:
+                client.symbol_select(self.symbol, True)
+            except Exception:
+                pass
+            result = client.order_send(request)
+            return result, client.last_error()
+        except Exception as exc:
+            return None, exc
+        finally:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+
+    def _history_deals_once(self, from_time: dt.datetime, to_time: dt.datetime) -> Tuple[Optional[Any], Any]:
+        client = MetaTrader5(host=self.config.host, port=self.config.port)
+        try:
+            ok = client.initialize()
+            if not ok:
+                return None, client.last_error()
+            deals = client.history_deals_get(from_time, to_time)
+            return deals, client.last_error()
+        except Exception as exc:
+            return None, exc
+        finally:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+
+    def _symbol_info_once(self) -> Tuple[Optional[Any], Any]:
+        client = MetaTrader5(host=self.config.host, port=self.config.port)
+        try:
+            ok = client.initialize()
+            if not ok:
+                return None, client.last_error()
+            try:
+                client.symbol_select(self.symbol, True)
+            except Exception:
+                pass
+            info = client.symbol_info(self.symbol)
+            return info, client.last_error()
+        except Exception as exc:
+            return None, exc
+        finally:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+
     def _seed_equity(self) -> None:
         equity = self._get_equity()
         metrics = self.account_metrics.update(equity, self.state.current_day)
@@ -302,8 +511,9 @@ class XAUUSDMomentumSurferStrategy:
         self._save_state()
 
     def _get_equity(self) -> float:
-        for attempt in range(3):
-            info = self.mt5.account_info()
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            info, error = self._account_info_once()
             if info is not None:
                 equity = getattr(info, "equity", None)
                 if equity is None:
@@ -313,10 +523,11 @@ class XAUUSDMomentumSurferStrategy:
                     return float(equity)
             self._equity_fail_streak += 1
             self._log(
-                "account_info unavailable (attempt %s/3, streak=%s): %s",
+                "account_info unavailable (attempt %s/%s, streak=%s): %s",
                 attempt + 1,
+                max_attempts,
                 self._equity_fail_streak,
-                self.mt5.last_error(),
+                error,
             )
             time.sleep(1)
             if self._equity_fail_streak < 3:
@@ -328,7 +539,7 @@ class XAUUSDMomentumSurferStrategy:
             except Exception as exc:
                 self._connect_fail_streak += 1
                 self._log("Reconnect attempt failed (streak=%s): %s", self._connect_fail_streak, exc)
-        raise RuntimeError(f"account_info is None after reconnect attempts: {self.mt5.last_error()}")
+        raise RuntimeError(f"account_info unavailable after reconnect attempts: {self.mt5.last_error()}")
 
     def _ensure_day_context(self, bar_time: dt.datetime) -> None:
         day_key = bar_time.date().isoformat()
@@ -397,6 +608,54 @@ class XAUUSDMomentumSurferStrategy:
                 self._trigger_loss_cooldown(now)
             return
         self._cooldown_active(now)
+
+    def _pause_until_active(self, raw_until: Optional[str], label: str, now: Optional[dt.datetime] = None) -> bool:
+        if not raw_until:
+            return False
+        try:
+            until = dt.datetime.fromisoformat(str(raw_until))
+        except Exception:
+            return False
+        current = now or self._chart_now()
+        if current < until:
+            self._log("%s active until %s", label, until.isoformat(sep=" "))
+            return True
+        return False
+
+    def _loss_close_pause_active(self, now: Optional[dt.datetime] = None) -> bool:
+        if self._pause_until_active(self.state.loss_pause_until, "Loss-close pause", now):
+            return True
+        if self.state.loss_pause_until:
+            self.state.loss_pause_until = None
+            self._save_state()
+        return False
+
+    def _profit_close_pause_active(self, now: Optional[dt.datetime] = None) -> bool:
+        if self._pause_until_active(self.state.profit_pause_until, "Profit-close pause", now):
+            return True
+        if self.state.profit_pause_until:
+            self.state.profit_pause_until = None
+            self._save_state()
+        return False
+
+    def _activate_loss_close_pause(self, close_profit: float, closed_at: Optional[dt.datetime] = None) -> None:
+        minutes = int(self.config.loss_close_pause_minutes)
+        if minutes <= 0 or close_profit >= 0:
+            return
+        base = closed_at or self._chart_now()
+        until = base + dt.timedelta(minutes=minutes)
+        self.state.loss_pause_until = until.isoformat(timespec="seconds")
+        self._save_state()
+        self._log("Loss-close pause triggered: profit=%.2f until=%s", close_profit, self.state.loss_pause_until)
+
+    def _activate_profit_close_pause(self) -> None:
+        minutes = int(self.config.profit_close_pause_minutes)
+        if minutes <= 0:
+            return
+        until = self._chart_now() + dt.timedelta(minutes=minutes)
+        self.state.profit_pause_until = until.isoformat(timespec="seconds")
+        self._save_state()
+        self._log("Profit-close pause triggered until=%s", self.state.profit_pause_until)
 
     def _risk_guard(self, snapshot: MarketSnapshot) -> None:
         equity = self._get_equity()
@@ -467,7 +726,9 @@ class XAUUSDMomentumSurferStrategy:
 
         bar_time = self._bar_time(last_closed)
         atr = self._atr(bars[:-1], self.config.atr_period)
-        baseline_atr = self._atr(bars[:-1 - max(0, self.config.mom_lookback)], min(self.config.vol_lookback, self.config.atr_period))
+        baseline_period = min(self.config.vol_lookback, self.config.atr_period)
+        baseline_offset = min(max(0, self.config.mom_lookback), len(bars) - baseline_period - 2)
+        baseline_atr = self._atr(bars[:-1 - baseline_offset], baseline_period)
         vol_ratio = atr / max(baseline_atr, 1e-9)
 
         mom_1 = closes[-1] - closes[-2] if len(closes) >= 2 else 0.0
@@ -491,17 +752,6 @@ class XAUUSDMomentumSurferStrategy:
         else:
             signal, strength = self._decide_signal(mom_1, mom_2, accel, accel_score, atr, vol_ratio)
 
-        # HTF filter temporarily disabled - uncomment to re-enable
-
-        #     signal = "NONE"
-        #     strength = 0.0
-
-        #     signal = "NONE"
-        #     strength = 0.0
-
-        #     signal = "NONE"
-        #     strength = 0.0
-
         return MarketSnapshot(
             bar_time=bar_time,
             close=float(last_closed["close"]),
@@ -523,50 +773,28 @@ class XAUUSDMomentumSurferStrategy:
 
     def _fetch_bars(self, min_count: Optional[int] = None) -> List[Dict[str, float]]:
         fetch_count = max(int(self.config.lookback_bars), int(min_count or 0))
-        while True:
-            for attempt in range(3):
-                # Wine/pymt5linux can leave a persistent client in a half-open state where
-                # initialize()/account_info() keep succeeding but copy_rates_from_pos() starts
-                # returning "No IPC connection" after one or two calls.  Refresh the bridge
-                # client before market-data pulls; this is cheaper and safer than restarting
-                # the terminal/bridge loop.
-                try:
-                    self.mt5.shutdown()
-                except Exception:
-                    pass
-                time.sleep(0.2)
-                if self.config.terminal_path:
-                    ok = self.mt5.initialize(path=self.config.terminal_path)
-                else:
-                    ok = self.mt5.initialize()
-                if ok:
-                    try:
-                        self.mt5.symbol_select(self.symbol, True)
-                    except Exception:
-                        pass
-                rates = self.mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, fetch_count)
-                if rates is not None:
-                    self._rates_fail_streak = 0
-                    return [self._normalize_bar(row) for row in list(rates)]
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            rates, error = self._copy_rates_once(self.timeframe, fetch_count)
+            if rates is not None:
+                self._rates_fail_streak = 0
+                return [self._normalize_bar(row) for row in list(rates)]
 
-                self._rates_fail_streak += 1
-                self._log(
-                    "copy_rates_from_pos unavailable (attempt %s/3, streak=%s): %s",
-                    attempt + 1,
-                    self._rates_fail_streak,
-                    self.mt5.last_error(),
-                )
-                time.sleep(1)
-                if self._rates_fail_streak < 3:
-                    continue
-                try:
-                    self._handle_transient_ipc(RuntimeError("copy_rates_from_pos unavailable"))
-                    self._rates_fail_streak = 0
-                    self._connect_fail_streak = 0
-                except Exception as exc:
-                    self._connect_fail_streak += 1
-                    self._log("Reconnect after rates failure failed (streak=%s): %s", self._connect_fail_streak, exc)
-                break
+            self._rates_fail_streak += 1
+            self._log(
+                "copy_rates_from_pos unavailable (attempt %s/%s, streak=%s): %s",
+                attempt + 1,
+                max_attempts,
+                self._rates_fail_streak,
+                error,
+            )
+            time.sleep(1)
+            if self._rates_fail_streak >= 3:
+                self._handle_transient_ipc(RuntimeError("copy_rates_from_pos unavailable"))
+                self._rates_fail_streak = 0
+                self._connect_fail_streak = 0
+
+        raise RuntimeError(f"copy_rates_from_pos failed after {max_attempts} attempts: {self.mt5.last_error()}")
 
     def _normalize_bar(self, row: Any) -> Dict[str, float]:
         def get(key: str, fallback_index: Optional[int] = None) -> float:
@@ -606,7 +834,7 @@ class XAUUSDMomentumSurferStrategy:
             return False
 
     def _bar_time(self, bar: Dict[str, float]) -> dt.datetime:
-        return dt.datetime.fromtimestamp(int(bar["time"]))
+        return self._mt5_timestamp_to_chart_time(int(bar["time"]))
 
     def _atr(self, bars: Sequence[Dict[str, float]], period: int) -> float:
         if len(bars) < period + 1:
@@ -696,9 +924,9 @@ class XAUUSDMomentumSurferStrategy:
         else:
             return "NONE", 0.0, meta
 
-        zone_values = [ema9, ema21, avwap]
-        zone_low = min(zone_values)
-        zone_high = max(zone_values)
+        # ponytail: AVWAP is logged as context; EMA9/21 is the actionable reclaim zone.
+        zone_low = min(ema9, ema21)
+        zone_high = max(ema9, ema21)
         zone_width = zone_high - zone_low
         compressed = zone_width <= atr * compression_atr
         meta["compressed"] = compressed
@@ -783,7 +1011,6 @@ class XAUUSDMomentumSurferStrategy:
         return 1.0 + compression_score + reclaim_distance + body_score
 
     def _handle_bar(self, snapshot: MarketSnapshot) -> None:
-        self._sync_closed_trades()
         all_positions = self._all_positions()
         positions = [pos for pos in all_positions if int(pos.magic) == int(self.config.magic)]
         foreign_positions = [pos for pos in all_positions if int(pos.magic) != int(self.config.magic)]
@@ -813,6 +1040,11 @@ class XAUUSDMomentumSurferStrategy:
             self._log("Trading paused: %s", self.state.paused_reason)
             return
 
+        if self._loss_close_pause_active(snapshot.bar_time) or self._profit_close_pause_active(snapshot.bar_time):
+            for pos in positions:
+                self._trail_position(snapshot, pos)
+            return
+
         if self._cooldown_active(snapshot.bar_time):
             if positions:
                 self._trail_position(snapshot, positions[0])
@@ -837,21 +1069,38 @@ class XAUUSDMomentumSurferStrategy:
                 return
             self._trail_position(snapshot, pos)
 
-        if all_position_lots > 0.5:
+        if all_position_lots >= float(self.config.max_lots):
             self._log(
-                "Open position lots %.2f > 0.50; skip new entry but signal remains %s.",
+                "Open position lots %.2f >= max_lots %.2f; skip new entry but signal remains %s.",
                 all_position_lots,
+                self.config.max_lots,
                 snapshot.signal,
             )
             return
 
         if snapshot.signal != "NONE" and self._cooldown_ok(snapshot.bar_time):
+            if 0 < time.time() - self._last_reconnect_ts < 60:
+                self._log("Recent MT5 reconnect; skip new entry until bridge is stable for 60s.")
+                return
             self._enter(snapshot)
 
     def _all_positions(self) -> List[PositionState]:
         raw = self.mt5.positions_get(symbol=self.symbol)
-        if not raw:
-            return []
+        if raw is None:
+            raw, error = self._positions_once()
+            if raw is None:
+                if error is not None:
+                    self._log("positions_get unavailable through fresh client: %s", error)
+                return []
+        if len(raw) == 0:
+            fresh_raw, error = self._positions_once()
+            if fresh_raw is None:
+                if error is not None:
+                    self._log("positions_get empty and fresh client unavailable: %s", error)
+                return []
+            raw = fresh_raw
+            if len(raw) == 0:
+                return []
         out: List[PositionState] = []
         for pos in raw:
             out.append(
@@ -892,8 +1141,9 @@ class XAUUSDMomentumSurferStrategy:
                 if pos.sl <= 0 or new_sl > pos.sl:
                     self._modify_position(pos, sl=new_sl, tp=pos.tp)
             else:
-                base_sl = pos.sl if pos.sl > 0 else current_price + snapshot.atr * 100.0
-                new_sl = min(base_sl, current_price + snapshot.atr * self.config.trail_lock_atr)
+                new_sl = current_price + snapshot.atr * self.config.trail_lock_atr
+                if pos.sl > 0:
+                    new_sl = min(pos.sl, new_sl)
                 if pos.sl <= 0 or new_sl < pos.sl:
                     self._modify_position(pos, sl=new_sl, tp=pos.tp)
 
@@ -957,20 +1207,23 @@ class XAUUSDMomentumSurferStrategy:
     def _size_position(self, direction: str, price: float, sl: float) -> float:
         equity = self._get_equity()
         risk_amount = equity * self.config.risk_pct
-        info = self.mt5.symbol_info(self.symbol)
+        info, error = self._symbol_info_once()
         if info is None:
-            raise RuntimeError("symbol_info unavailable")
+            # Fallback to cached symbol info
+            info = self._cached_symbol_info
+            if info is None:
+                raise RuntimeError(f"symbol_info unavailable: {error}")
 
         risk_per_lot = self._risk_per_lot(direction, price, sl)
         if risk_per_lot <= 0:
             raise RuntimeError("risk_per_lot invalid")
 
         raw_volume = risk_amount / risk_per_lot
-        raw_volume = min(raw_volume, self.config.max_lots)
+        raw_volume = min(raw_volume, self.config.max_lots, self.config.max_lots_per_order)
 
         margin_lot = self._margin_per_lot(direction, price)
         if margin_lot > 0:
-            acc = self.mt5.account_info()
+            acc, _error = self._account_info_once()
             free_margin = float(getattr(acc, "margin_free", equity) if acc is not None else equity)
             max_by_margin = (free_margin * 0.85) / margin_lot
             raw_volume = min(raw_volume, max_by_margin)
@@ -979,7 +1232,7 @@ class XAUUSDMomentumSurferStrategy:
         step = float(getattr(info, "volume_step", 0.01))
         raw_volume = max(raw_volume, min_vol)
         volume = self._round_volume(raw_volume, step)
-        return min(volume, self.config.max_lots)
+        return min(volume, self.config.max_lots, self.config.max_lots_per_order)
 
     def _risk_per_lot(self, direction: str, price: float, sl: float) -> float:
         order_type = self.mt5.ORDER_TYPE_BUY if direction == "BUY" else self.mt5.ORDER_TYPE_SELL
@@ -989,7 +1242,9 @@ class XAUUSDMomentumSurferStrategy:
                 return abs(float(value))
         except Exception:
             pass
-        info = self.mt5.symbol_info(self.symbol)
+        info, _error = self._symbol_info_once()
+        if info is None:
+            info = self._cached_symbol_info
         if info is None:
             return 0.0
         contract_size = float(getattr(info, "trade_contract_size", 1.0))
@@ -1017,10 +1272,16 @@ class XAUUSDMomentumSurferStrategy:
             "tp": float(tp),
             "deviation": int(self.config.deviation),
             "magic": int(self.config.magic),
-            "comment": "xauusd-surfer-live" if self.config.live else "xauusd-surfer-dryrun",
+            "comment": self._entry_order_comment(),
             "type_time": self.mt5.ORDER_TIME_GTC,
             "type_filling": filling,
         }
+
+    def _entry_order_comment(self) -> str:
+        configured = str(self.config.order_comment or "").strip()
+        if configured:
+            return configured[:31]
+        return ("xauusd-surfer-live" if self.config.live else "xauusd-surfer-dryrun")[:31]
 
     def _select_filling_mode(self) -> int:
         info = self.mt5.symbol_info(self.symbol)
@@ -1058,7 +1319,7 @@ class XAUUSDMomentumSurferStrategy:
             tried.append(mode)
             req = dict(request)
             req["type_filling"] = mode
-            result = self.mt5.order_send(req)
+            result, _error = self._order_send_once(req)
             last_result = result
             self._log("order_send(type_filling=%s) -> %s", mode, self._result_to_dict(result))
             if result is not None:
@@ -1080,10 +1341,10 @@ class XAUUSDMomentumSurferStrategy:
             "comment": "surfer-trail",
         }
         if self.config.live:
-            result = self.mt5.order_send(request)
+            result, error = self._order_send_once(request)
             self._log("SLTP modify result: %s", self._result_to_dict(result))
             if result is None:
-                self._log("SLTP modify failed: %s", self.mt5.last_error())
+                self._log("SLTP modify failed: %s", error)
         else:
             self._log("DRY-RUN SLTP modify: %s", request)
 
@@ -1114,10 +1375,24 @@ class XAUUSDMomentumSurferStrategy:
             else:
                 self._log("DRY-RUN close request: %s", request)
 
+    def _maybe_profit_close_on_loop(self) -> None:
+        threshold = float(self.config.profit_close_usd)
+        if threshold <= 0:
+            return
+        positions = self._positions()
+        if not positions:
+            return
+        floating_profit = sum(float(pos.profit) for pos in positions)
+        if floating_profit < threshold:
+            return
+        self._log("Profit-close threshold hit: floating_profit=%.2f threshold=%.2f", floating_profit, threshold)
+        self.close_all_positions()
+        self._activate_profit_close_pause()
+
     def _tick_prices(self) -> Tuple[float, float]:
-        tick = self.mt5.symbol_info_tick(self.symbol)
+        tick, error = self._tick_once()
         if tick is None:
-            raise RuntimeError(f"symbol_info_tick failed: {self.mt5.last_error()}")
+            raise RuntimeError(f"symbol_info_tick failed: {error}")
         ask = float(getattr(tick, "ask", 0.0) or getattr(tick, "last", 0.0) or 0.0)
         bid = float(getattr(tick, "bid", 0.0) or getattr(tick, "last", 0.0) or 0.0)
         if ask <= 0 or bid <= 0:
@@ -1125,21 +1400,21 @@ class XAUUSDMomentumSurferStrategy:
         return ask, bid
 
     def _point(self) -> float:
-        info = self.mt5.symbol_info(self.symbol)
-        if info is None:
-            raise RuntimeError("symbol_info unavailable")
+        if self._cached_point and self._cached_point > 0:
+            return float(self._cached_point)
+        info = self._symbol_info()
         return float(getattr(info, "point", 0.0) or 0.0)
 
     def _digits(self) -> int:
-        info = self.mt5.symbol_info(self.symbol)
-        if info is None:
-            raise RuntimeError("symbol_info unavailable")
+        if self._cached_digits is not None:
+            return int(self._cached_digits)
+        info = self._symbol_info()
         return int(getattr(info, "digits", 0) or 0)
 
     def _spread_points(self) -> float:
-        tick = self.mt5.symbol_info_tick(self.symbol)
+        tick, error = self._tick_once()
         if tick is None:
-            raise RuntimeError(f"symbol_info_tick failed: {self.mt5.last_error()}")
+            raise RuntimeError(f"symbol_info_tick failed: {error}")
         ask = float(getattr(tick, "ask", 0.0) or getattr(tick, "last", 0.0) or 0.0)
         bid = float(getattr(tick, "bid", 0.0) or getattr(tick, "last", 0.0) or 0.0)
         if ask <= 0 or bid <= 0:
@@ -1182,101 +1457,108 @@ class XAUUSDMomentumSurferStrategy:
         return elapsed >= float(self.config.cooldown_seconds)
 
     def _max_hold_exceeded(self, pos: PositionState, bar_time: dt.datetime) -> bool:
+        if int(self.config.max_hold_minutes) <= 0:
+            return False
         if pos.time_open is None:
             return False
-        opened = dt.datetime.fromtimestamp(int(pos.time_open))
-        held_minutes = (bar_time - opened).total_seconds() / 60.0
+        # MT5 bar timestamps and position timestamps can be in different timezone
+        # conventions under Wine/pymt5linux. Use monotonic wall-clock age for hold time
+        # so a fresh position is not closed immediately by chart/server time skew.
+        held_minutes = max(0.0, (time.time() - float(pos.time_open)) / 60.0)
         return held_minutes >= float(self.config.max_hold_minutes)
 
-    def _sync_closed_trades(self) -> None:
-        # 若尚未處理過任何成交，則從今日凌晨開始同步
-        if self.state.last_processed_deal_time is None:
-            from_time = dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        else:
-            # 原本的邏輯：抓取最近30天（確保不會漏掉跨日成交）
-            from_time = dt.datetime.now() - dt.timedelta(days=30)
-        to_time = dt.datetime.now()
-        
-        self._log(
-            "同步平倉成交 | last_processed_deal_time=%s from_time=%s to_time=%s",
-            self.state.last_processed_deal_time,
-            from_time.isoformat(),
-            to_time.isoformat(),
+    def _deal_net_profit(self, deal: Any) -> float:
+        return (
+            float(getattr(deal, "profit", 0.0) or 0.0)
+            + float(getattr(deal, "commission", 0.0) or 0.0)
+            + float(getattr(deal, "swap", 0.0) or 0.0)
         )
-        
-        try:
-            deals = self.mt5.history_deals_get(from_time, to_time)
-        except Exception:
-            self._log("取得歷史成交失敗")
-            return
-        
-        self._log("取得 %d 筆歷史成交", len(deals) if deals else 0)
-        if not deals:
-            # 若歷史成交為空但今日有交易，視為連續虧損（保守估計）
-            if self.state.trades_today > 0:
-                self._log("歷史成交為空，但今日已有 %d 筆交易，視為連續虧損", self.state.trades_today)
-                self.state.consecutive_losses = self.state.trades_today
-                if self.state.last_trade_time:
-                    self.state.last_processed_deal_time = self.state.last_trade_time
-                self._save_state()
-            return
-        
-        latest_seen = self.state.last_processed_deal_time
+
+    def _is_owned_closing_deal(self, deal: Any) -> bool:
+        symbol = str(getattr(deal, "symbol", "") or "")
+        if symbol != self.config.symbol:
+            return False
+        magic = int(getattr(deal, "magic", 0) or 0)
+        if magic != int(self.config.magic):
+            return False
+        entry = getattr(deal, "entry", None)
         close_entries = {
             getattr(self.mt5, "DEAL_ENTRY_OUT", 1),
             getattr(self.mt5, "DEAL_ENTRY_OUT_BY", 3),
         }
-        
-        for deal in list(deals):
+        return entry is None or int(entry) in close_entries
+
+    def _mt5_timestamp_to_chart_time(self, timestamp: int) -> dt.datetime:
+        return dt.datetime.fromtimestamp(int(timestamp), dt.UTC).replace(tzinfo=None)
+
+    def _sync_closed_trades(self) -> None:
+        to_time = self._history_query_now()
+        from_time = to_time - dt.timedelta(days=30)
+        try:
+            deals, error = self._history_deals_once(from_time, to_time)
+            if deals is None and error is not None:
+                # Fallback to long-lived client
+                deals = self.mt5.history_deals_get(from_time, to_time)
+        except Exception as exc:
+            self._log("Closed deal sync failed: %s", exc)
+            return
+        if not deals:
+            return
+        latest_seen = self.state.last_processed_deal_time
+        latest_seen_ticket = int(self.state.last_processed_deal_ticket or 0)
+        ordered_deals = sorted(
+            list(deals),
+            key=lambda item: (int(getattr(item, "time", 0) or 0), int(getattr(item, "ticket", 0) or 0)),
+        )
+        for deal in ordered_deals:
             deal_time = getattr(deal, "time", None)
             if deal_time is None:
                 continue
-            deal_iso = dt.datetime.fromtimestamp(int(deal_time)).isoformat()
-            if latest_seen is not None and deal_iso <= latest_seen:
+            deal_ticket = int(getattr(deal, "ticket", 0) or 0)
+            deal_iso = self._mt5_timestamp_to_chart_time(int(deal_time)).isoformat()
+            if latest_seen is not None:
+                if deal_iso < latest_seen:
+                    continue
+                if deal_iso == latest_seen and deal_ticket <= latest_seen_ticket:
+                    continue
+            if not self._is_owned_closing_deal(deal):
                 continue
-            
-            entry = getattr(deal, "entry", None)
-            if entry is not None and entry not in close_entries:
-                continue
-            
-            gross_profit = float(getattr(deal, "profit", 0.0))
-            commission = float(getattr(deal, "commission", 0.0))
-            swap = float(getattr(deal, "swap", 0.0))
-            net_profit = gross_profit + commission + swap
-            deal_ticket = getattr(deal, "ticket", 0)
-            order_ticket = getattr(deal, "order", 0)
-            symbol = str(getattr(deal, "symbol", self.symbol))
-            
+            closed_at = dt.datetime.fromisoformat(deal_iso)
+            net_profit = self._deal_net_profit(deal)
             self.state.last_close_profit = net_profit
             self.state.last_processed_deal_time = deal_iso
+            self.state.last_processed_deal_ticket = deal_ticket
             latest_seen = deal_iso
-            
+            latest_seen_ticket = deal_ticket
+            if abs(net_profit) < REALIZED_PNL_NOISE_USD:
+                self._log(
+                    "Closed deal sync ignored noise | time=%s ticket=%s symbol=%s magic=%s net=%.2f consecutive_losses=%d",
+                    deal_iso,
+                    deal_ticket,
+                    getattr(deal, "symbol", ""),
+                    getattr(deal, "magic", ""),
+                    net_profit,
+                    self.state.consecutive_losses,
+                )
+                continue
             if net_profit < 0:
                 self.state.consecutive_losses += 1
+                if self.state.consecutive_losses >= int(self.config.loss_cooldown_losses):
+                    self._trigger_loss_cooldown(closed_at)
+                self._activate_loss_close_pause(net_profit, closed_at)
             elif net_profit > 0:
                 self.state.consecutive_losses = 0
                 self.state.loss_cooldown_until = None
                 self.state.loss_cooldown_triggered_at = None
-            
             self._log(
-                "Closed deal sync | time=%s deal=%s order=%s symbol=%s entry=%s gross=%.2f commission=%.2f swap=%.2f net=%.2f consecutive_losses=%d",
+                "Closed deal sync | time=%s ticket=%s symbol=%s magic=%s net=%.2f consecutive_losses=%d",
                 deal_iso,
                 deal_ticket,
-                order_ticket,
-                symbol,
-                entry,
-                gross_profit,
-                commission,
-                swap,
+                getattr(deal, "symbol", ""),
+                getattr(deal, "magic", ""),
                 net_profit,
                 self.state.consecutive_losses,
             )
-            
-            if self.state.consecutive_losses >= int(self.config.loss_cooldown_losses):
-                deal_dt = dt.datetime.fromtimestamp(int(deal_time))
-                if not self.state.loss_cooldown_until:
-                    self._trigger_loss_cooldown(deal_dt)
-        
         self._save_state()
 
     def _resolve_timeframe(self, tf: str) -> int:
@@ -1298,7 +1580,19 @@ class XAUUSDMomentumSurferStrategy:
 
     def _is_transient_ipc_issue(self, exc: Exception) -> bool:
         text = str(exc).lower()
-        keywords = ("broken pipe", "connection reset", "transport", "ipc", "timeout", "dead object")
+        keywords = (
+            "broken pipe",
+            "connection reset",
+            "transport",
+            "ipc",
+            "no ipc connection",
+            "stream has been closed",
+            "timeout",
+            "dead object",
+            "symbol_info unavailable",
+            "account_info unavailable",
+            "copy_rates_from_pos failed",
+        )
         return any(keyword in text for keyword in keywords)
 
     def _handle_transient_ipc(self, exc: Exception) -> None:
@@ -1313,6 +1607,10 @@ class XAUUSDMomentumSurferStrategy:
             self.mt5.shutdown()
         except Exception:
             pass
+        # pymt5linux client objects can remain poisoned after EOFError/No IPC connection.
+        # Recreate the client before initialize(), rather than reusing the closed stream.
+        self.mt5 = MetaTrader5(host=self.config.host, port=self.config.port)
+        self.timeframe = self._resolve_timeframe(self.config.timeframe)
         time.sleep(1)
         self._connect()
         self._prepare_symbol()
@@ -1332,6 +1630,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profit-target", type=float, default=0.15)
     parser.add_argument("--risk-pct", type=float, default=0.01)
     parser.add_argument("--max-lots", type=float, default=3.0)
+    parser.add_argument("--max-lots-per-order", type=float, default=3.0)
     parser.add_argument("--max-leverage", type=float, default=10.0)
     parser.add_argument("--atr-period", type=int, default=14)
     parser.add_argument("--vol-lookback", type=int, default=50)
@@ -1355,6 +1654,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-consecutive-losses", type=int, default=5)
     parser.add_argument("--loss-cooldown-losses", type=int, default=3)
     parser.add_argument("--loss-cooldown-minutes", type=int, default=15)
+    parser.add_argument("--loss-close-pause-minutes", type=int, default=0)
+    parser.add_argument("--profit-close-usd", type=float, default=0.0)
+    parser.add_argument("--profit-close-pause-minutes", type=int, default=0)
     parser.add_argument("--cooldown-seconds", type=int, default=30)
     parser.add_argument("--max-hold-minutes", type=int, default=120)
     parser.add_argument("--loop-seconds", type=int, default=10)
@@ -1368,6 +1670,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--deviation", type=int, default=30)
     parser.add_argument("--magic", type=int, default=210511)
+    parser.add_argument("--order-comment", default="")
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -1392,6 +1695,7 @@ def main() -> None:
         profit_target=float(args.profit_target),
         risk_pct=float(args.risk_pct),
         max_lots=float(args.max_lots),
+        max_lots_per_order=float(args.max_lots_per_order),
         max_leverage=float(args.max_leverage),
         atr_period=int(args.atr_period),
         vol_lookback=int(args.vol_lookback),
@@ -1411,6 +1715,9 @@ def main() -> None:
         max_consecutive_losses=int(args.max_consecutive_losses),
         loss_cooldown_losses=int(args.loss_cooldown_losses),
         loss_cooldown_minutes=int(args.loss_cooldown_minutes),
+        loss_close_pause_minutes=int(args.loss_close_pause_minutes),
+        profit_close_usd=float(args.profit_close_usd),
+        profit_close_pause_minutes=int(args.profit_close_pause_minutes),
         cooldown_seconds=int(args.cooldown_seconds),
         max_hold_minutes=int(args.max_hold_minutes),
         loop_seconds=int(args.loop_seconds),
@@ -1420,6 +1727,7 @@ def main() -> None:
         terminal_path=terminal_path,
         deviation=int(args.deviation),
         magic=int(args.magic),
+        order_comment=str(args.order_comment),
         log_level=args.log_level,
     )
 
