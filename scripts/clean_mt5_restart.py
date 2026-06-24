@@ -20,7 +20,7 @@ PORT = 18812
 PATTERNS = [
     "mt5_xauusd_momentum_surfer_strategy.py",
     "mt5_xauusd_asian_reversal_strategy.py",
-    "mt5_doomsday_strategy.py",
+    "mt5_xauusd_trend_strategy.py",
     "mt5_strategy_fleet_supervisor.py",
     "mt5_bridge_supervisor.py",
     "pymt5linux",

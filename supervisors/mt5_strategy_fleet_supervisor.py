@@ -27,60 +27,23 @@ BRIDGE_UNHEALTHY_RESTART_THRESHOLD = 3
 BRIDGE_SYNC_WAIT_SECONDS = 5
 ACTIVE_PLAN = AUTO_QUANT_DIR / "active_plan.json"
 
-DEFAULT_DOOMSDAY_CMD = [
+DEFAULT_FALLBACK_CMD = [
     "python3.14",
-    str(STRATEGIES_DIR / "mt5_doomsday_strategy.py"),
-    "--symbol",
-    "XAUUSD",
-    "--timeframe",
-    "M5",
-    "--host",
-    HOST,
-    "--port",
-    str(PORT),
+    str(STRATEGIES_DIR / "mt5_xauusd_trend_strategy.py"),
+    "--symbol", "XAUUSD",
+    "--timeframe", "M1",
+    "--host", HOST,
+    "--port", str(PORT),
     "--live",
-    "--risk-pct",
-    "0.0075",
-    "--stop-atr",
-    "5.0",
-    "--reward-multiple",
-    "10.0",
-    "--tp-min-usd",
-    "30.0",
-    "--tp-max-usd",
-    "80.0",
-    "--long-bias",
-    "0.85",
-    "--trend-threshold",
-    "0.25",
-    "--roll-trigger-pct",
-    "0.10",
-    "--cooldown-minutes",
-    "60",
-    "--max-leverage",
-    "5.0",
-    "--max-drawdown-pct",
-    "0.06",
-    "--max-daily-loss-pct",
-    "0.03",
-    "--max-lots",
-    "3.0",
-    "--magic",
-    "203493",
-    "--deviation",
-    "30",
-    "--loop-seconds",
-    "10",
-    "--lookback-bars",
-    "120",
-    "--atr-period",
-    "14",
-    "--fast-sma",
-    "10",
-    "--slow-sma",
-    "30",
-    "--log-level",
-    "INFO",
+    "--risk-pct", "0.0020",
+    "--stop-atr", "2.5",
+    "--reward-multiple", "3.0",
+    "--max-lots", "1.0",
+    "--magic", "204573",
+    "--deviation", "30",
+    "--loop-seconds", "15",
+    "--lookback-bars", "240",
+    "--log-level", "INFO",
 ]
 
 DEFAULT_TUNER_CMD = [
@@ -214,9 +177,6 @@ def _load_active_plan() -> Optional[Dict[str, object]]:
     if strategy_path.parent != STRATEGIES_DIR:
         return None
     allowed_strategy_files = {
-        "mt5_doomsday_strategy.py",
-        "mt5_doomsday_v4_strategy.py",
-        "mt5_xauusd_10d_breakout_strategy.py",
         "mt5_xauusd_asian_reversal_strategy.py",
         "mt5_xauusd_momentum_surfer_strategy.py",
         "mt5_xauusd_trend_strategy.py",
@@ -235,9 +195,9 @@ def _resolve_strategy_specs(plan: Optional[Dict]) -> List[Dict]:
     run_tuner = True
     if plan is None:
         specs.append({
-            "name": "doomsday",
-            "cmd": list(DEFAULT_DOOMSDAY_CMD),
-            "log_file": str(ROOT / "mt5_doomsday_strategy_supervised.log"),
+            "name": "fallback_trend",
+            "cmd": list(DEFAULT_FALLBACK_CMD),
+            "log_file": str(ROOT / "mt5_fallback_trend.log"),
         })
     else:
         if plan.get("enabled") is False:
