@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="/home/chain4655/Documents/Projects/MT5"
 LOG_DIR="$ROOT/logs"
-SUPERVISOR="$ROOT/supervisors/mt5_bridge_supervisor.py"
+SUPERVISOR="$ROOT/supervisors/mt5_strategy_fleet_supervisor.py"
 PID_FILE="$LOG_DIR/mt5_supervisor.pid"
 CLEAN_RESTART="$ROOT/scripts/clean_mt5_restart.py"
 
@@ -11,8 +11,8 @@ mkdir -p "$LOG_DIR"
 
 start() {
     cd "$ROOT"
-    if pgrep -f "mt5_bridge_supervisor.py" >/dev/null; then
-        echo "Refusing start: mt5_bridge_supervisor.py already running. Use '$0 restart' for clean restart."
+    if pgrep -f "mt5_strategy_fleet_supervisor.py" >/dev/null; then
+        echo "Refusing start: mt5_strategy_fleet_supervisor.py already running. Use '$0 restart' for clean restart."
         status
         exit 1
     fi
@@ -23,7 +23,7 @@ start() {
     fi
     python3.14 "$SUPERVISOR" > "$LOG_DIR/mt5_supervisor.log" 2>&1 &
     echo $! > "$PID_FILE"
-    echo "mt5_bridge_supervisor.py started (PID: $!)"
+    echo "mt5_strategy_fleet_supervisor.py started (PID: $!)"
 }
 
 stop() {

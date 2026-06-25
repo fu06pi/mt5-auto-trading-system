@@ -27,97 +27,22 @@ BRIDGE_UNHEALTHY_RESTART_THRESHOLD = 3
 BRIDGE_SYNC_WAIT_SECONDS = 5
 ACTIVE_PLAN = AUTO_QUANT_DIR / "active_plan.json"
 
-DEFAULT_DOOMSDAY_CMD = [
+DEFAULT_FALLBACK_CMD = [
     "python3.14",
-    str(STRATEGIES_DIR / "mt5_doomsday_strategy.py"),
-    "--symbol",
-    "XAUUSD",
-    "--timeframe",
-    "M5",
-    "--host",
-    HOST,
-    "--port",
-    str(PORT),
-    "--live",
-    "--risk-pct",
-    "0.0075",
-    "--stop-atr",
-    "5.0",
-    "--reward-multiple",
-    "10.0",
-    "--tp-min-usd",
-    "30.0",
-    "--tp-max-usd",
-    "80.0",
-    "--long-bias",
-    "0.85",
-    "--trend-threshold",
-    "0.25",
-    "--roll-trigger-pct",
-    "0.10",
-    "--cooldown-minutes",
-    "60",
-    "--max-leverage",
-    "5.0",
-    "--max-drawdown-pct",
-    "0.06",
-    "--max-daily-loss-pct",
-    "0.03",
-    "--max-lots",
-    "3.0",
-    "--magic",
-    "203493",
-    "--deviation",
-    "30",
-    "--loop-seconds",
-    "10",
-    "--lookback-bars",
-    "120",
-    "--atr-period",
-    "14",
-    "--fast-sma",
-    "10",
-    "--slow-sma",
-    "30",
-    "--log-level",
-    "INFO",
-]
-
-DEFAULT_MOMENTUM_SURFER_CMD = [
-    "python3.14",
-    str(STRATEGIES_DIR / "mt5_xauusd_momentum_surfer_strategy.py"),
+    str(STRATEGIES_DIR / "mt5_xauusd_trend_strategy.py"),
     "--symbol", "XAUUSD",
-    "--timeframe", "M5",
+    "--timeframe", "M1",
     "--host", HOST,
     "--port", str(PORT),
     "--live",
-    "--start-equity", "10000.0",
-    "--daily-dd-limit", "0.03",
-    "--total-dd-limit", "0.06",
-    "--profit-target", "0.15",
-    "--risk-pct", "0.012",
-    "--max-lots", "3.0",
-    "--max-leverage", "10.0",
-    "--atr-period", "14",
-    "--vol-lookback", "50",
-    "--mom-lookback", "3",
-    "--accel-min", "1.10",
-    "--entry-buffer-atr", "0.10",
+    "--risk-pct", "0.0020",
     "--stop-atr", "2.5",
-    "--reward-multiple", "1.0",
-    "--trail-trigger-atr", "1.50",
-    "--trail-lock-atr", "0.25",
-    "--max-spread-points", "150.0",
-    "--max-trades-per-day", "9999",
-    "--max-consecutive-losses", "5",
-    "--cooldown-seconds", "30",
-    "--max-hold-minutes", "120",
-    "--loop-seconds", "10",
-    "--lookback-bars", "120",
-    "--state-path", str(AUTO_QUANT_DIR / "state" / "xauusd_momentum_surfer_state.json"),
-    "--log-file", str(AUTO_QUANT_DIR / "logs" / "xauusd_momentum_surfer.log"),
+    "--reward-multiple", "3.0",
+    "--max-lots", "1.0",
+    "--magic", "204573",
     "--deviation", "30",
-    "--magic", "210511",
+    "--loop-seconds", "15",
+    "--lookback-bars", "240",
     "--log-level", "INFO",
 ]
 
@@ -129,22 +54,6 @@ DEFAULT_TUNER_CMD = [
     "300",
 ]
 
-DEFAULT_STRATEGY_SPECS = [
-    {
-        "name": "doomsday",
-        "cmd": DEFAULT_DOOMSDAY_CMD,
-        "log_file": str(ROOT / "mt5_doomsday_strategy_supervised.log"),
-        "restart_on_exit": True,
-    },
-    {
-        "name": "auto_quant_tuner",
-        "cmd": DEFAULT_TUNER_CMD,
-        "log_file": str(ROOT / "auto_quant" / "runner.log"),
-        "source": "auto_quant",
-        "restart_on_exit": True,
-    },
-]
-STRATEGY_SPECS = DEFAULT_STRATEGY_SPECS
 
 
 def log(msg: str) -> None:
@@ -173,7 +82,10 @@ def bridge_healthy() -> bool:
         from pymt5linux import MetaTrader5
         mt5 = MetaTrader5(host=HOST, port=PORT)
         try:
-            if not mt5.initialize(path=TERMINAL_PATH):
+            # Do NOT pass path=TERMINAL_PATH — that spawns a new MT5 GUI window.
+            # The existing terminal64.exe + bridge should already be running;
+            # initialize() without a path connects to the existing instance.
+            if not mt5.initialize():
                 return False
             ti = mt5.terminal_info()
             ai = mt5.account_info()
@@ -265,9 +177,7 @@ def _load_active_plan() -> Optional[Dict[str, object]]:
     if strategy_path.parent != STRATEGIES_DIR:
         return None
     allowed_strategy_files = {
-        "mt5_doomsday_strategy.py",
-        "mt5_doomsday_v4_strategy.py",
-        "mt5_xauusd_10d_breakout_strategy.py",
+        "mt5_xauusd_asian_reversal_strategy.py",
         "mt5_xauusd_momentum_surfer_strategy.py",
         "mt5_xauusd_trend_strategy.py",
     }
@@ -280,19 +190,18 @@ def _load_active_plan() -> Optional[Dict[str, object]]:
     return plan
 
 
-def _resolve_strategy_specs(plan: Optional[Dict]) -> Tuple[List[Dict], bool]:
+def _resolve_strategy_specs(plan: Optional[Dict]) -> List[Dict]:
     specs: List[Dict] = []
     run_tuner = True
     if plan is None:
         specs.append({
-            "name": "doomsday",
-            "cmd": list(DEFAULT_DOOMSDAY_CMD),
-            "log_file": str(ROOT / "mt5_doomsday_strategy_supervised.log"),
-            "restart_on_exit": True,
+            "name": "fallback_trend",
+            "cmd": list(DEFAULT_FALLBACK_CMD),
+            "log_file": str(ROOT / "mt5_fallback_trend.log"),
         })
     else:
         if plan.get("enabled") is False:
-            return [], False
+            return []
         name = str(plan.get("name", "active"))
         cmd = [str(item) for item in plan.get("cmd", [])]
         log_file = str(plan.get("log_file", ""))
@@ -301,7 +210,6 @@ def _resolve_strategy_specs(plan: Optional[Dict]) -> Tuple[List[Dict], bool]:
             "name": name,
             "cmd": cmd,
             "log_file": log_file or str(ROOT / f"{name}_supervised.log"),
-            "restart_on_exit": True,
         })
         for comp in plan.get("complementary", []):
             if comp.get("enabled") is False:
@@ -314,7 +222,6 @@ def _resolve_strategy_specs(plan: Optional[Dict]) -> Tuple[List[Dict], bool]:
                     "name": cname,
                     "cmd": ccmd,
                     "log_file": clog or str(ROOT / f"{cname}_supervised.log"),
-                    "restart_on_exit": True,
                 })
     if run_tuner:
         specs.append({
@@ -322,9 +229,8 @@ def _resolve_strategy_specs(plan: Optional[Dict]) -> Tuple[List[Dict], bool]:
             "cmd": DEFAULT_TUNER_CMD,
             "log_file": str(ROOT / "auto_quant" / "runner.log"),
             "source": "auto_quant",
-            "restart_on_exit": True,
         })
-    return specs, run_tuner
+    return specs
 
 
 def main() -> None:
@@ -334,7 +240,6 @@ def main() -> None:
     bridge_proc: Optional[subprocess.Popen] = None
     procs: Dict[str, Optional[subprocess.Popen]] = {}
     restart_counts: Dict[str, int] = {}
-    completed: Dict[str, bool] = {}
     active_plan_hash: Optional[str] = None
     log("Fleet supervisor started")
     while True:
@@ -352,10 +257,9 @@ def main() -> None:
                             pass
                 procs.clear()
                 restart_counts.clear()
-                completed.clear()
                 time.sleep(2)
 
-            active_specs, run_tuner = _resolve_strategy_specs(plan)
+            active_specs = _resolve_strategy_specs(plan)
 
             bridge_alive = bridge_server_alive()
             healthy = bridge_healthy() if bridge_alive else False
@@ -404,8 +308,6 @@ def main() -> None:
                 sname = spec["name"]
                 if sname not in restart_counts:
                     restart_counts[sname] = 0
-                if sname not in completed:
-                    completed[sname] = False
 
             # Cleanup stale tracking entries
             active_names = {s["name"] for s in active_specs}
@@ -419,25 +321,16 @@ def main() -> None:
                         except Exception:
                             pass
                     restart_counts.pop(sname, None)
-                    completed.pop(sname, None)
 
             for spec in active_specs:
                 name = spec["name"]
                 proc = procs.get(name)
-                restart_on_exit = bool(spec.get("restart_on_exit", True))
-                if completed.get(name):
-                    continue
                 if proc is None:
                     procs[name] = start_strategy(spec)
                     restart_counts[name] += 1
                     time.sleep(2)
                     continue
                 if proc.poll() is not None:
-                    if not restart_on_exit:
-                        log(f"Strategy[{name}] completed; not restarting")
-                        completed[name] = True
-                        procs[name] = None
-                        continue
                     if restart_counts[name] >= MAX_RESTARTS:
                         log(f"Strategy[{name}] restart limit reached; waiting")
                         continue
